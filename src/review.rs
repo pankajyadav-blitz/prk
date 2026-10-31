@@ -47,7 +47,10 @@ pub enum End {
 enum ClaudeError {
     UsageLimit(String),
     Stopped,
+    /// Worth another attempt: a network, git, gh or Claude hiccup.
     Failed(String),
+    /// Would end the same way again (timeout, budget), so no retry.
+    Final(String),
 }
 
 impl From<String> for ClaudeError {
@@ -103,6 +106,11 @@ impl Reviewer {
                 &format!("Claude usage limit: {why}"),
                 db::now() + USAGE_LIMIT_SECONDS,
             ),
+            // ctrl-c on a review started by hand means cancel; a stopping
+            // listener means "do it on the next start".
+            End::Stopped if job.source == "manual" => {
+                self.db.finish(job.id, db::SKIPPED, "cancelled")
+            }
             End::Stopped => self.db.requeue(job.id, "stopped; queued again", 0),
         }
         end
@@ -211,7 +219,8 @@ impl Reviewer {
                     .describe(job.id, &info.head, &info.title, &info.author, "review", "");
             }
             let login = github::login(&self.exec)?;
-            let started = chrono::Utc::now() - chrono::Duration::seconds(5);
+            // A minute of slack in case this machine's clock runs ahead of GitHub's.
+            let started = chrono::Utc::now() - chrono::Duration::seconds(60);
             let since = started.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let log = self.log_path(&pr, &info.head);
             self.db.set_log(job.id, &log.to_string_lossy());
@@ -237,10 +246,30 @@ impl Reviewer {
                 },
             );
             let context = self.context(&info, &dir);
-            self.run_claude(&pr, &prompt, &context, &dir, &log, stop)?;
+            let ran = self.run_claude(&pr, &prompt, &context, &dir, &log, stop);
 
+            // Collect what was posted even when Claude did not finish: those
+            // comments are on the PR now, and a retry would post them twice.
             self.step(job, "collecting comments");
-            let posted = github::posted_since(&self.exec, &pr, &login, &since, job.id)?;
+            let posted = github::posted_since(&self.exec, &pr, &login, &since, job.id);
+            let posted = match (ran, posted) {
+                (Ok(()), posted) => posted?,
+                (Err(e), Ok(posted)) if !posted.is_empty() => {
+                    let why = match &e {
+                        ClaudeError::UsageLimit(w)
+                        | ClaudeError::Failed(w)
+                        | ClaudeError::Final(w) => w.clone(),
+                        ClaudeError::Stopped => "stopped".to_string(),
+                    };
+                    self.db.save_comments(&posted);
+                    let summary = match &follow_up {
+                        Some(_) => self.record_verdicts(&earlier, &posted, &info.head),
+                        None => count(&posted),
+                    };
+                    return Ok(format!("{summary} (cut short: {why})"));
+                }
+                (Err(e), _) => return Err(e),
+            };
             self.db.save_comments(&posted);
             Ok(match &follow_up {
                 Some(_) => self.record_verdicts(&earlier, &posted, &info.head),
@@ -256,6 +285,10 @@ impl Reviewer {
             Err(ClaudeError::UsageLimit(why)) => End::UsageLimit(why),
             Err(ClaudeError::Stopped) => End::Stopped,
             Err(ClaudeError::Failed(why)) => self.failed(job, why),
+            Err(ClaudeError::Final(why)) => {
+                self.db.finish(job.id, db::FAILED, &why);
+                End::Failed(why)
+            }
         }
     }
 
@@ -518,6 +551,9 @@ impl Reviewer {
             .stdout(file)
             .stderr(stderr);
         self.exec.with_env(&mut cmd);
+        // Its own process group, so stopping it also stops what it started
+        // (shell commands, gh, git), and a ctrl-c in prk's terminal reaches prk only.
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("{}: {e}", self.cfg().claude.bin))?;
@@ -530,14 +566,14 @@ impl Reviewer {
                 Err(e) => return Err(ClaudeError::Failed(format!("waiting for claude: {e}"))),
             }
             if stop.is_set() || Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 if stop.is_set() {
                     return Err(ClaudeError::Stopped);
                 }
-                return Err(ClaudeError::Failed(format!(
-                    "timed out after {} minutes",
-                    review.timeout_minutes
+                return Err(ClaudeError::Final(format!(
+                    "timed out after {} minute{} (raise review.timeout_minutes, or review it by hand)",
+                    review.timeout_minutes,
+                    if review.timeout_minutes == 1 { "" } else { "s" }
                 )));
             }
             stop.wait(1.0);
@@ -547,6 +583,12 @@ impl Reviewer {
         }
         let tail = log_tail(log, 5);
         let lower = tail.to_lowercase();
+        if lower.contains("exceeded usd budget") {
+            return Err(ClaudeError::Final(format!(
+                "stopped at review.max_budget_usd = {} ({tail}); raise it for big PRs",
+                review.max_budget_usd
+            )));
+        }
         if lower.contains("usage limit")
             || lower.contains("limit reached")
             || lower.contains("rate_limit")
@@ -557,6 +599,30 @@ impl Reviewer {
             "claude exited with {status}: {tail}"
         )))
     }
+}
+
+/// Stop a child started in its own process group, and everything it started:
+/// SIGTERM to the group, then SIGKILL if it is still there after 5 seconds.
+fn kill_group(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let signal = |sig: &str| {
+        let _ = Command::new("kill")
+            .args([sig, "--", &group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    signal("-TERM");
+    for _ in 0..50 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The leader may be gone while its children linger, so the group gets the
+    // KILL either way; it fails harmlessly once the group is empty.
+    signal("-KILL");
+    let _ = child.wait();
 }
 
 /// At most `max` characters of `text`, marked when cut.

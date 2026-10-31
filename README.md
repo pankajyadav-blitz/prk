@@ -400,7 +400,9 @@ stay even if someone deletes them on GitHub.
 3. **Look up.** `gh pr view`: closed, merged and draft PRs are skipped.
 4. **Already reviewed?** Skipped when this commit was already reviewed by `prk`, or
    when your GitHub account already left a review or comment on this commit (by hand,
-   or from `prk` on another machine). `prk review -f` overrides both.
+   or from `prk` on another machine). `prk review -f` overrides both. Comments count
+   for the commit they were *written* on: GitHub moves an older comment's commit
+   forward when the line did not change, and that must not hide new commits.
 5. **Check out.** The repo is cloned into `workdir/repos/<org>/<repo>-pr<n>` over ssh,
    the PR head and its **base branch** (`main`, or whatever the PR targets) are fetched,
    and the PR head is checked out. Claude reads the whole repo as it is in the PR, not
@@ -495,9 +497,12 @@ full review instead. Set `review.follow_up = false` to always do full reviews, o
 | You already reviewed it on GitHub at this commit | Skipped: `already reviewed on GitHub` |
 | New commits after a review | A [follow-up](#follow-up-reviews) |
 | PR merged, closed or turned draft before its turn | Skipped with the reason |
-| A review fails (clone error, timeout, Claude error) | Retried after 5, then 10 minutes; `failed` after 3 attempts |
+| A review fails on a passing problem (network, gh, git, Claude error) | Retried after 5, then 10 minutes; `failed` after 3 attempts |
+| A review times out, or hits `max_budget_usd` | `failed` at once, with a hint: a retry would end the same way and cost the same again |
+| Claude posted some comments, then failed or was stopped | The posted comments are saved and the job is `reviewed` with "(cut short: ...)", so a retry never posts them twice |
 | Claude usage limit | The queue pauses for 30 minutes; the PR waits without losing an attempt |
-| `prk` stopped or crashed mid-review | The job is queued again on the next start |
+| `prk` stopped or crashed mid-review | Claude and everything it started are stopped; the job is queued again for the next start |
+| ctrl-c during `prk review <url>` | Cancelled: Claude is stopped and the job is marked `skipped: cancelled`, not queued again |
 | Request posted as a thread reply | Seen live; **not** seen by catch-up, which only reads main channel messages |
 
 ---

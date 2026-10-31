@@ -281,6 +281,11 @@ fn review_now(cfg: Config, db: Arc<Db>, url: &str, force: bool, dry_run: bool) {
     let reviewer = Reviewer::new(cfg, db.clone(), dry_run);
 
     println!("{} {}", bold(&pr.key()), dim(&pr.url()));
+    // Log lines would break into the step lines; the outcome is printed below.
+    // With -v they stay, for debugging.
+    if !log::verbose() {
+        activity::get().set_tui(true);
+    }
     let worker = {
         let stop = stop.clone();
         let job = job.clone();
@@ -290,14 +295,19 @@ fn review_now(cfg: Config, db: Arc<Db>, url: &str, force: bool, dry_run: bool) {
     let end = worker
         .join()
         .unwrap_or(End::Failed("review thread crashed".into()));
+    activity::get().set_tui(false);
     let job = db.job(id).ok().flatten().unwrap_or(job);
     let (glyph, color) = view::status_look(&job.status);
     let summary = match &end {
         End::Reviewed(why) => format!("{} {}", view::status_word(&job), why),
         End::Skipped(why) => format!("skipped: {why}"),
-        End::Retry(why) | End::Failed(why) => format!("failed: {why}"),
+        End::Retry(why) => format!(
+            "failed, retried {} by a running prk: {why}",
+            view::when(job.not_before)
+        ),
+        End::Failed(why) => format!("failed: {why}"),
         End::UsageLimit(why) => format!("Claude usage limit: {why}"),
-        End::Stopped => "stopped".to_string(),
+        End::Stopped => "cancelled".to_string(),
     };
     println!(
         "{} {}  {}",
@@ -500,10 +510,18 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
                         continue;
                     }
                 };
-                match reviewer.process(&job, &stop) {
+                let end = reviewer.process(&job, &stop);
+                // The kind is decided while the job runs, so read it back.
+                let kind = db
+                    .job(job.id)
+                    .ok()
+                    .flatten()
+                    .map(|j| j.kind)
+                    .unwrap_or_default();
+                match end {
                     End::Reviewed(why) => info!(
                         "{} {}: {why}",
-                        if job.kind == "follow-up" {
+                        if kind == "follow-up" {
                             "followed up"
                         } else {
                             "reviewed"

@@ -102,6 +102,11 @@ fn pulls(pr: &PrRef, what: &str) -> String {
 
 /// Whether `login` already left a review or a review comment on commit `head`,
 /// by prk or by hand, here or on another machine.
+///
+/// A comment's `commit_id` is not where it was written: GitHub moves it to the
+/// newest commit while the line is unchanged (71 of the last 100 on suchna had
+/// moved). Matching it would make every earlier comment look written on the new
+/// head and skip the follow-up, so comments match on `original_commit_id`.
 pub fn reviewed_at(exec: &Exec, pr: &PrRef, login: &str, head: &str) -> Result<bool, String> {
     let reviewed = list(exec, &pulls(pr, "reviews"))?
         .iter()
@@ -111,7 +116,12 @@ pub fn reviewed_at(exec: &Exec, pr: &PrRef, login: &str, head: &str) -> Result<b
     }
     Ok(list(exec, &pulls(pr, "comments"))?
         .iter()
-        .any(|c| by(c, login) && (s(c, "commit_id") == head || s(c, "original_commit_id") == head)))
+        .any(|c| wrote_on(c, login, head)))
+}
+
+/// A review comment `login` wrote on commit `head` (not one GitHub moved there).
+fn wrote_on(comment: &Value, login: &str, head: &str) -> bool {
+    by(comment, login) && s(comment, "original_commit_id") == head
 }
 
 /// `login`'s inline review comments on the PR that start a thread (not replies).
@@ -221,6 +231,17 @@ mod tests {
         assert_eq!(verdict_of("⚠️ Still present in abc"), Some("open"));
         assert_eq!(verdict_of(" ↔️ Partly fixed"), Some("partly"));
         assert_eq!(verdict_of("Looks fine"), None);
+    }
+
+    #[test]
+    fn a_comment_moved_forward_by_github_is_not_written_on_the_new_head() {
+        let moved =
+            json!({"user": {"login": "me"}, "commit_id": "new", "original_commit_id": "old"});
+        assert!(!wrote_on(&moved, "me", "new"));
+        assert!(wrote_on(&moved, "me", "old"));
+        let other =
+            json!({"user": {"login": "you"}, "commit_id": "new", "original_commit_id": "new"});
+        assert!(!wrote_on(&other, "me", "new"));
     }
 
     #[test]

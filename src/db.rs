@@ -103,6 +103,20 @@ pub struct Comment {
     pub created_at: String,
 }
 
+/// Whether `pid` is a live prk process; a pid the system handed to something
+/// else since does not count.
+fn is_prk(pid: i64) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|cmd| {
+            let argv0 = cmd.split(|b| *b == 0).next().unwrap_or_default();
+            let argv0 = String::from_utf8_lossy(argv0);
+            Path::new(argv0.as_ref())
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("prk"))
+        })
+        .unwrap_or(false)
+}
+
 /// What `enqueue` did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Enqueued {
@@ -430,7 +444,7 @@ impl Db {
         };
         let mut recovered = 0;
         for (id, pid) in running {
-            if pid > 0 && Path::new(&format!("/proc/{pid}")).exists() {
+            if pid > 0 && is_prk(pid) {
                 continue;
             }
             self.requeue(id, "interrupted; queued again", 0);

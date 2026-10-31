@@ -203,4 +203,24 @@ mod tests {
         assert_eq!(pr.key(), "Blitzscale-19/suchna#826");
         assert!(PrRef::parse("https://github.com/Blitzscale-19/suchna").is_none());
     }
+
+    /// Run the matcher over messages exported from a real channel:
+    /// PRK_FIXTURE=<json array> PRK_REVIEWER=<member id> cargo test -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_channel_messages() {
+        let path = std::env::var("PRK_FIXTURE").expect("PRK_FIXTURE");
+        let reviewer = std::env::var("PRK_REVIEWER").expect("PRK_REVIEWER");
+        let messages: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut found = 0;
+        for m in &messages {
+            if let Some(r) = request(m, "CPWCB54G2", &reviewer, &orgs()) {
+                found += 1;
+                let prs: Vec<String> = r.prs.iter().map(PrRef::key).collect();
+                println!("MATCH {} by {}: {}", r.ts, r.user, prs.join(", "));
+            }
+        }
+        println!("MATCHED {found} of {}", messages.len());
+    }
 }
