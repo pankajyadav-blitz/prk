@@ -9,6 +9,16 @@ Someone posts in `#peer-review`:
 
 `prk` sees the tag, checks out the PR, reviews it with Claude Code's `/code-review`,
 and posts the findings on the PR as inline comments **from your GitHub account**.
+When the author pushes fixes and tags you again, `prk` runs a **follow-up**: it checks
+each earlier comment, replies *fixed* / *still present* / *partly fixed* in its thread,
+and reviews only what changed.
+
+It also:
+- **catches up** on requests posted while it was not running
+- **keeps a queue** that survives restarts, and retries failed reviews
+- **skips** what was already reviewed, by `prk` or by you on GitHub
+- shows a **live dashboard**, a **history** (`prk -H`) and the **comments** each
+  review posted (`prk -c`), all in the terminal
 
 Everything it needs (your Slack id, your GitHub token, your Claude token, review rules
 per repo) lives in one config file, so anyone can run their own copy on their own
@@ -25,11 +35,16 @@ machine or on a server.
 5. [Create the config file](#5-create-the-config-file)
 6. [Check and run](#6-check-and-run)
 7. [Run it as a service](#7-run-it-as-a-service)
-8. [Config reference](#config-reference)
-9. [Review rules](#review-rules)
-10. [How a review runs](#how-a-review-runs)
-11. [Files and paths](#files-and-paths)
-12. [Troubleshooting](#troubleshooting)
+- [Commands](#commands)
+- [The dashboard](#the-dashboard)
+- [History and comments](#history-and-comments)
+- [How a review runs](#how-a-review-runs)
+- [Follow-up reviews](#follow-up-reviews)
+- [Queue, catch-up and edge cases](#queue-catch-up-and-edge-cases)
+- [Review rules](#review-rules)
+- [Config reference](#config-reference)
+- [Files and paths](#files-and-paths)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -82,14 +97,17 @@ To update later: `git pull && cargo install --path .`
    add `message.channels` (and `message.groups` for a private channel) → **Save Changes**.
 5. **Install App** → **Install to Workspace** → Allow. Reinstall whenever Slack asks
    after a scope change.
-6. In Slack, open the channel (`#peer-review`) and run:
+6. **OAuth & Permissions** → copy the **Bot User OAuth Token** (`xoxb-...`). This is
+   `slack.bot_token`. `prk` uses it to catch up on requests posted while it was off.
+   You can leave it out, but then only requests posted while `prk` runs are seen.
+7. In Slack, open the channel (`#peer-review`) and run:
    ```
    /invite @prk-<yourname>
    ```
-7. Get the channel id: open the channel → click its name at the top → the id
+8. Get the channel id: open the channel → click its name at the top → the id
    (`C0...`) is at the bottom of the About tab. For `#peer-review` it is `CPWCB54G2`.
    This is `slack.channel`.
-8. Get **your own** member id: click your profile picture → **Profile** → **⋮** →
+9. Get **your own** member id: click your profile picture → **Profile** → **⋮** →
    **Copy member ID** (`U0...`). This is `slack.reviewer`. Messages that tag this id
    start a review.
 
@@ -121,18 +139,35 @@ with `ssh -T git@github.com`.
 
 ## 4. Get a Claude token
 
-Pick one:
+With the Claude Code CLI installed, the easiest way is to let `prk` do it, **after**
+you have created the config file (step 5):
+
+```bash
+prk setup-token
+```
+
+This runs `claude setup-token`, which opens a browser to log in with your Claude
+subscription and prints a long-lived token (`sk-ant-oat01-...`). Paste it when `prk`
+asks (the input is hidden). `prk` writes it into `[claude] oauth_token` in your config,
+keeps every other line and comment as it was, clears `api_key`, and sets the file to
+mode 600.
+
+Already have a token? Save it without the browser step:
+
+```bash
+prk setup-token --token sk-ant-oat01-...
+```
+
+Other options:
 
 | Option | How | Cost |
 |---|---|---|
-| **Subscription token** (recommended) | Run `claude setup-token`, log in, copy the `sk-ant-oat01-...` token | Uses your Claude Pro/Max/Team plan's usage limits. No per-review charge. |
-| API key | https://console.anthropic.com → API Keys (`sk-ant-api03-...`) | Billed per token used |
+| **Subscription token** (recommended) | `prk setup-token` (above), or `claude setup-token` and paste it into `claude.oauth_token` yourself | Uses your Claude Pro/Max/Team plan's usage limits. No per-review charge. |
+| API key | https://console.anthropic.com → API Keys (`sk-ant-api03-...`) into `claude.api_key` | Billed per token used |
 | Nothing | Leave both empty | Uses whoever is logged in with `claude` on this machine |
 
-Put the token in `claude.oauth_token` **or** the key in `claude.api_key`, not both.
-
 With a subscription, reviews share your plan's limits with your own Claude Code use.
-When the limit is reached, `prk` pauses for 30 minutes and retries the same PR.
+When the limit is reached, `prk` pauses the queue for 30 minutes and then retries.
 
 ---
 
@@ -151,14 +186,15 @@ chmod 600 ~/.config/prk/config.toml
 nano ~/.config/prk/config.toml
 ```
 
-**Option B: create a minimal one** with only the required fields. Replace every value
-in `<...>`:
+**Option B: create a minimal one** with only the main fields. Replace every value in
+`<...>`:
 
 ```bash
 mkdir -p ~/.config/prk
 cat > ~/.config/prk/config.toml <<'EOF'
 [slack]
 app_token = "<xapp-... from step 2>"
+bot_token = "<xoxb-... from step 2, for catch-up>"
 channel   = "CPWCB54G2"
 reviewer  = "<your Slack member id, U0...>"
 
@@ -167,7 +203,7 @@ token   = "<github_pat_... from step 3>"
 ssh_key = "~/.ssh/id_ed25519"
 
 [claude]
-oauth_token = "<sk-ant-oat01-... from step 4>"
+oauth_token = ""
 
 [rules]
 all = """
@@ -175,6 +211,7 @@ all = """
 """
 EOF
 chmod 600 ~/.config/prk/config.toml
+prk setup-token          # fills in claude.oauth_token (step 4)
 ```
 
 `chmod 600` is required: the file holds tokens, and `prk` refuses to start while other
@@ -188,45 +225,36 @@ users can read it.
 prk check
 ```
 
-Every line should say `ok`:
+Every line should have a ✓:
 
 ```
-config   /home/you/.config/prk/config.toml
-ok    slack    app token works; watching CPWCB54G2 for <@U0XXXXXXX>
-ok    github   comments will be posted as your-github-login
-ok    git ssh  ssh to github.com works
-ok    claude   2.x (Claude Code) via oauth_token (subscription)
-rules    all: set; repos: suchna
+config /home/you/.config/prk/config.toml
+✓ slack     app token works; watching CPWCB54G2 for <@U0XXXXXXX>
+✓ catch-up  bot token reads the channel; catches up 24h back
+✓ github    comments will be posted as your-github-login
+✓ git ssh   ssh to github.com works
+✓ claude    2.x (Claude Code) via oauth_token (subscription)
+· rules     all: set; repos: suchna
 ```
 
 Make sure the `github` line names **your** account.
 
-Then try one review by hand before turning on the listener. Use a PR of your own
-first, since this posts real comments:
+Try one review by hand before turning on the listener. Use a PR of your own first,
+since this posts real comments:
 
 ```bash
 prk review https://github.com/Blitzscale-19/<repo>/pull/<n> --dry-run   # look up only
 prk review https://github.com/Blitzscale-19/<repo>/pull/<n>             # real review
 ```
 
-Start listening:
+Then start listening:
 
 ```bash
-prk                    # listen; ctrl-c to stop
-prk --dry-run -v       # log what would be reviewed, review nothing
+prk
 ```
 
-All commands:
-
-| Command | What it does |
-|---|---|
-| `prk` | Listen in the Slack channel and review PRs when you are tagged |
-| `prk check` | Check the config and that Slack, GitHub, ssh and Claude work |
-| `prk review <PR url>` | Review one PR now, without Slack |
-| `prk review <PR url> --force` | Review again even if this commit was already reviewed |
-| `--dry-run` | Look PRs up and log what would happen; run and post nothing |
-| `-v`, `--verbose` | Debug logging, including every git/gh command |
-| `--config <path>` | Use a different config file |
+In a terminal this opens the [dashboard](#the-dashboard). Under systemd or with
+output redirected, it prints plain log lines instead.
 
 ---
 
@@ -249,46 +277,202 @@ journalctl --user -u prk -f        # live log
 systemctl --user restart prk       # after editing the config
 ```
 
+While the service runs, `prk -H`, `prk -c` and `prk --stats` still work from any
+terminal: they read the same local database.
+
 `prk.service` sets a `PATH` with `~/.cargo/bin`, `~/.local/bin` and `~/.bun/bin`.
 If `gh`, `git` or `claude` is installed somewhere else, add that folder to the
 `Environment=PATH=` line.
 
 ---
 
-## Config reference
+## Commands
 
-Top-level keys (like `workdir`) must come **before** the first `[table]`, or TOML files
-them under that table. Unknown keys are an error, so a typo is caught instead of
-being ignored.
+| Command | What it does |
+|---|---|
+| `prk` | Listen for review requests. In a terminal: the live dashboard. |
+| `prk -H` | Review history (a scrollable screen in a terminal, a table when piped) |
+| `prk -H <PR url>` | Every attempt for one PR, with result, who asked, time taken and log path |
+| `prk -H --today` | Only today. Also `--since 12h` / `7d` / `2w`, `-r <repo>`, `-s <status>`, `-n <count>`, `-a` (no limit) |
+| `prk -c` | The comments the most recent review posted |
+| `prk -c <PR url>` | The comments the latest review of that PR posted, with follow-up verdicts |
+| `prk -c <PR url> -a` | The comments of every review of that PR |
+| `prk --stats` | Totals: reviewed today / 7 days, skipped, failed, average time, comments, verdicts, by repo |
+| `prk review <PR url>` | Review one PR now, showing each step as it runs, then its comments |
+| `prk review <PR url> -f` | A full review even if this commit was already reviewed (no follow-up) |
+| `prk check` | Check the config and that Slack, catch-up, GitHub, ssh and Claude work |
+| `prk setup-token` | Create a Claude subscription token and save it in the config |
+| `-d`, `--dry-run` | Look PRs up and say what would happen; review and post nothing |
+| `-v`, `--verbose` | Debug logging, including every git/gh command |
+| `--config <path>` | Use a different config file |
 
-| Key | Required | Default | What it is |
-|---|---|---|---|
-| `workdir` | | `~/.local/share/prk` | Repo clones, logs and the state database |
-| **`[slack]`** | | | |
-| `app_token` | ✅ | | Slack app-level token, `xapp-...`, scope `connections:write` |
-| `channel` | ✅ | | Channel id to watch, e.g. `CPWCB54G2` for `#peer-review` |
-| `reviewer` | ✅ | | Your Slack member id (`U0...`). Tags of this id start a review. |
-| **`[github]`** | | | |
-| `token` | | gh login | Fine-grained token; comments are posted as this account |
-| `ssh_key` | | ssh setup | Private key for `git clone`/`fetch` |
-| `ssh_host` | | `github.com` | Host in `git@<host>:org/repo.git`; an `~/.ssh/config` alias works |
-| `orgs` | | `["Blitzscale-19"]` | PR links from other owners are ignored |
-| **`[claude]`** | | | |
-| `oauth_token` | | | From `claude setup-token` (subscription) |
-| `api_key` | | | From console.anthropic.com (pay per token). Not with `oauth_token`. |
-| `bin` | | `claude` | The Claude Code executable |
-| `model` | | Claude Code default | Model for reviews |
-| **`[review]`** | | | |
-| `level` | | `medium` | `/code-review` depth: `low`, `medium`, `high`, `xhigh` |
-| `max_budget_usd` | | `2` | Stop one review at this estimated cost. `0` = no cap. With an API key this is real money; with a subscription it caps review size. |
-| `timeout_minutes` | | `30` | Kill a review still running after this long |
-| `drafts` | | `false` | Review draft PRs too |
-| `allowed_tools` | | built-in list | Tools Claude may use; see [How a review runs](#how-a-review-runs) |
-| **`[rules]`** | | | |
-| `all` | | | Rules for every repo |
-| `[rules.repos.<repo>]` `rules` | | | Rules for one repo |
+Statuses: `waiting` (queued), `running`, `reviewed` (shown as `follow-up` for a
+follow-up), `skipped` (with the reason), `failed` (after 3 attempts).
 
-The full annotated example is `config.example.toml`.
+---
+
+## The dashboard
+
+`prk` in a terminal:
+
+```
+╭──────────────────────────────────────────────────────────────────────────────────────────╮
+│prk  watching CPWCB54G2 for <@U0ANSHUMAN>             ● connected  caught up: 2 new  up 2h│
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Reviewing ───────────────────────────────────────────────────────────────────────────────╮
+│⠹ naarad#285  admin report download  @c854526  hitesh                                     │
+│  reviewing           ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  4m10s  step 3m58s                        │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Queue (2) ───────────────────────────────────────────────────────────────────────────────╮
+│• soochi_dash#870        queued today 11:41     U0BTNU87 (slack)                          │
+│• otp_service#176        queued today 11:44     U0BTNU87 (catch-up)                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Recent ◂ ────────────────────────────────────────────────────────────────────────────────╮
+│✗ vartalap#504           failed      30m0s  today 11:05     timed out (attempt 1/3)       │
+│↷ suchna#826             skipped        1s  today 10:12     PR is merged                  │
+│✓ alfred#2014            follow-up   2m40s  today 09:58     follow-up: 1/2 fixed · 1 open │
+│✓ suchna#819             reviewed    3m52s  today 09:30     3 comments                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Log ─────────────────────────────────────────────────────────────────────────────────────╮
+│11:44:02 queued otp_service#176 (asked by U0BTNU87, catch-up)                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
+ q quit  ↑↓ select  tab queue/recent  enter details  o open PR  R re-review  x drop  p pause  H history
+```
+
+| Key | Does |
+|---|---|
+| `↑` `↓` / `j` `k` | Move the selection |
+| `tab` | Switch between Queue and Recent |
+| `enter` | Details of the selected review and the comments it posted |
+| `o` | Open the PR in the browser |
+| `R` | Review the selected PR again (a full review; asks first) |
+| `x` | Drop the selected PR from the queue |
+| `p` | Pause / resume the queue (the review in progress finishes) |
+| `H` | Switch to the history screen (`esc` back) |
+| `q` / `ctrl-c` | Quit. A review in progress is stopped and queued again for the next start. |
+
+A finished review flashes green (or red) in Recent for a few seconds.
+
+---
+
+## History and comments
+
+`prk -H` in a terminal opens a scrollable history:
+
+| Key | Does |
+|---|---|
+| `↑` `↓`, `PgUp` `PgDn`, `g` `G` | Scroll |
+| `/` | Search by repo, PR, title, author, status or reason (`esc` clears it) |
+| `enter` | Details: result, who asked and when, time taken, attempts, log path, and every comment it posted with its follow-up verdict |
+| `o` | Open the PR in the browser |
+| `R` | Review the PR again. The running `prk` picks it up from the queue. |
+
+Piped (`prk -H | less`) it prints a plain table instead.
+
+`prk -c <PR url>` prints the comments grouped by file:
+
+```
+Blitzscale-19/suchna#823 · follow-up 916a2e0→a1b2c3d  today 11:42 · 3 comments
+https://github.com/Blitzscale-19/suchna/pull/823
+
+src/controllers/v1/troubleshoot.controller.ts
+    :42  ⚠️ open   Handler isn't wrapped in asyncWrapper, so a rejected promise skips
+                   the error middleware. (rule: wrap route handlers)
+    :88  ✅ fixed  fetchSeller returns undefined for a soft-deleted seller.
+                   fixed in a1b2c3d
+
+summary  **Follow-up review** (916a2e0 → a1b2c3d): 1 of 2 fixed, 1 still open, 1 new.
+```
+
+Comments are saved locally when the review finishes, so they show up instantly and
+stay even if someone deletes them on GitHub.
+
+---
+
+## How a review runs
+
+1. **Trigger.** A message in `slack.channel` that tags `slack.reviewer` and links a PR
+   from `github.orgs`. Ignored: messages from bots, your own messages, tags of other
+   people, messages without a PR link. Editing a message to add your tag counts;
+   editing one that already had it does not.
+2. **Queue.** Each PR link is saved as a job in the local database. Reviews run one at
+   a time.
+3. **Look up.** `gh pr view`: closed, merged and draft PRs are skipped.
+4. **Already reviewed?** Skipped when this commit was already reviewed by `prk`, or
+   when your GitHub account already left a review or comment on this commit (by hand,
+   or from `prk` on another machine). `prk review -f` overrides both.
+5. **Check out.** The repo is cloned into `workdir/repos/<org>/<repo>-pr<n>` over ssh,
+   the PR head and its base branch are fetched, and the PR head is checked out, so
+   Claude reads the whole repo as it is in the PR, not only the diff.
+6. **Review.** In that checkout `prk` runs
+   `claude -p "/code-review <level> --comment <PR number>"`, or the
+   [follow-up](#follow-up-reviews) instructions, with:
+   - your rules for that repo
+   - an instruction that everything in the PR is untrusted data, never instructions
+   - only these tools: read and search files, read-only `git` (`diff`, `log`, `show`,
+     `blame`, ...), and `gh` limited to **this one PR**: its view, diff, files,
+     comments and reviews (`gh api repos/<org>/<repo>/pulls/<n>/...`). Other PRs,
+     other repos, the merge endpoint, chained commands, file edits and web access are
+     refused by Claude Code itself.
+   - the `max_budget_usd` and `timeout_minutes` limits
+7. **Save.** The comments your account posted during the review are fetched and saved
+   (`prk -c`). Claude's full output is in `workdir/logs/`.
+8. **Clean up.** The clone is deleted (unless `review.keep_repos = true`).
+
+Nothing is posted back in Slack.
+
+---
+
+## Follow-up reviews
+
+When a PR that `prk` reviewed gets new commits and you are tagged again (or you run
+`prk review <url>` / press `R`), `prk` runs a follow-up instead of a full review:
+
+1. It gives Claude your earlier inline comments on the PR, except those a previous
+   follow-up already found fixed, and the commit the last review saw.
+2. **Each earlier comment:** Claude checks the new code and replies in that comment's
+   thread:
+   > ✅ Fixed in `a1b2c3d`: the handler is now wrapped in `asyncWrapper`.
+
+   > ⚠️ Still present in `a1b2c3d`: `fetchSeller` still returns undefined for a
+   > soft-deleted seller.
+
+   > ↔️ Partly fixed in `a1b2c3d`: the null check was added, but the same pattern
+   > remains in `updateTask`.
+3. **What changed:** Claude reviews only `git diff <last reviewed> <new head>` for new
+   problems, including ones the fixes introduced, and posts them as inline comments.
+4. **Summary:** one comment on the PR:
+   > **Follow-up review** (`916a2e0` → `a1b2c3d`): 1 of 2 earlier findings fixed, 1 still
+   > open, 0 partly fixed, 1 new finding.
+
+`prk` records each verdict on the saved comment, so `prk -c` and the details screen
+show ✅ / ⚠️ / ↔️ next to it. Replies use the same `.../pulls/<n>/comments` endpoint
+(with `in_reply_to`), so a follow-up needs no extra GitHub access. Threads are not
+marked resolved; you or the author do that.
+
+If the earlier commit is gone (the branch was force-pushed or rebased), `prk` does a
+full review instead. Set `review.follow_up = false` to always do full reviews, or
+`review.once_per_pr = true` to review each PR only once.
+
+---
+
+## Queue, catch-up and edge cases
+
+| Case | What `prk` does |
+|---|---|
+| `prk` was off or started late | On start it reads the channel since the last message it saw, at most `catch_up_hours` back, and queues every request that tags you (needs `slack.bot_token`) |
+| First run ever | Catches up over the last `catch_up_hours` (default 24) |
+| Off for days | Never reads further back than `catch_up_hours`; set 72 to cover a weekend |
+| Same message seen live and by catch-up | Queued once (each Slack message becomes at most one job per PR) |
+| Same PR tagged in several messages | Queued once while it is waiting or running |
+| Commit already reviewed by `prk` | Skipped: `already reviewed at <commit>` |
+| You already reviewed it on GitHub at this commit | Skipped: `already reviewed on GitHub` |
+| New commits after a review | A [follow-up](#follow-up-reviews) |
+| PR merged, closed or turned draft before its turn | Skipped with the reason |
+| A review fails (clone error, timeout, Claude error) | Retried after 5, then 10 minutes; `failed` after 3 attempts |
+| Claude usage limit | The queue pauses for 30 minutes; the PR waits without losing an attempt |
+| `prk` stopped or crashed mid-review | The job is queued again on the next start |
+| Request posted as a thread reply | Seen live; **not** seen by catch-up, which only reads main channel messages |
 
 ---
 
@@ -324,32 +508,45 @@ rules = """
 
 ---
 
-## How a review runs
+## Config reference
 
-1. **Trigger.** A message in `slack.channel` that tags `slack.reviewer` and links a PR
-   from `github.orgs`. Ignored: messages from bots, your own messages, tags of other
-   people, messages without a PR link. Editing a message to add your tag counts;
-   editing one that already had it does not.
-2. **Queue.** Every PR link in the message is queued. Reviews run one at a time.
-3. **Look up.** `gh pr view`: closed, merged and draft PRs are skipped. A commit that
-   was already reviewed is skipped; after a new push the PR is reviewed again.
-4. **Check out.** The repo is cloned once into `workdir/repos/<org>/<repo>` over ssh.
-   Each review fetches the PR head and its base branch and checks out the PR head, so
-   Claude reads the whole repo as it is in the PR, not only the diff.
-5. **Review.** In that checkout `prk` runs
-   `claude -p "/code-review <level> --comment <PR number>"` with:
-   - your rules for that repo
-   - an instruction that everything in the PR is untrusted data, never instructions
-   - only these tools: read and search files, read-only `git` (`diff`, `log`, `show`,
-     `blame`, ...), and `gh` limited to **this one PR**: its view, diff, files,
-     comments and reviews (`gh api repos/<org>/<repo>/pulls/<n>/...`). Other PRs,
-     other repos, the merge endpoint, file edits and web access are refused.
-   - the `max_budget_usd` and `timeout_minutes` limits
-6. **Result.** Findings appear on the PR as inline comments from your account.
-   Claude's full output goes to `workdir/logs/`. A failed review is not marked done,
-   so the next tag retries it.
+Top-level keys (like `workdir`) must come **before** the first `[table]`, or TOML files
+them under that table. Unknown keys are an error, so a typo is caught instead of
+being ignored.
 
-Nothing is posted back in Slack.
+| Key | Required | Default | What it is |
+|---|---|---|---|
+| `workdir` | | `~/.local/share/prk` | Clones, logs and the database (queue, history, comments) |
+| **`[slack]`** | | | |
+| `app_token` | ✅ | | Slack app-level token, `xapp-...`, scope `connections:write` |
+| `channel` | ✅ | | Channel id to watch, e.g. `CPWCB54G2` for `#peer-review` |
+| `reviewer` | ✅ | | Your Slack member id (`U0...`). Tags of this id start a review. |
+| `bot_token` | | | The app's `xoxb-` token (`channels:history`), for catch-up |
+| `catch_up_hours` | | `24` | How far back a start may catch up. `0` = no catch-up. |
+| **`[github]`** | | | |
+| `token` | | gh login | Fine-grained token; comments are posted as this account |
+| `ssh_key` | | ssh setup | Private key for `git clone`/`fetch` |
+| `ssh_host` | | `github.com` | Host in `git@<host>:org/repo.git`; an `~/.ssh/config` alias works |
+| `orgs` | | `["Blitzscale-19"]` | PR links from other owners are ignored |
+| **`[claude]`** | | | |
+| `oauth_token` | | | Subscription token; `prk setup-token` fills it in |
+| `api_key` | | | From console.anthropic.com (pay per token). Not with `oauth_token`. |
+| `bin` | | `claude` | The Claude Code executable |
+| `model` | | Claude Code default | Model for reviews |
+| **`[review]`** | | | |
+| `level` | | `medium` | `/code-review` depth: `low`, `medium`, `high`, `xhigh` |
+| `max_budget_usd` | | `2` | Stop one review at this estimated cost. `0` = no cap. With an API key this is real money; with a subscription it caps review size. |
+| `timeout_minutes` | | `30` | Kill a review still running after this long |
+| `drafts` | | `false` | Review draft PRs too |
+| `keep_repos` | | `false` | Keep clones between reviews (faster) instead of deleting each one (saves disk) |
+| `follow_up` | | `true` | Follow-up reviews after new commits, instead of full reviews |
+| `once_per_pr` | | `false` | Review each PR only once |
+| `allowed_tools` | | built-in list | Tools Claude may use; `{owner}`, `{repo}`, `{number}` are filled in per PR |
+| **`[rules]`** | | | |
+| `all` | | | Rules for every repo |
+| `[rules.repos.<repo>]` `rules` | | | Rules for one repo |
+
+The full annotated example is `config.example.toml`.
 
 ---
 
@@ -359,12 +556,13 @@ Nothing is posted back in Slack.
 |---|---|
 | `~/.cargo/bin/prk` | The binary (`cargo install --path .`) |
 | `~/.config/prk/config.toml` | Your config (`chmod 600`). Override with `PRK_CONFIG` or `--config`. |
-| `~/.local/share/prk/repos/<org>/<repo>` | Kept clones, reused between reviews |
-| `~/.local/share/prk/logs/<org>-<repo>-<n>-<commit>.log` | Claude's output for each review |
-| `~/.local/share/prk/state.sqlite3` | Which PR commits were already reviewed |
+| `~/.local/share/prk/state.sqlite3` | The queue, the history, saved comments and how far Slack was read |
+| `~/.local/share/prk/logs/<org>-<repo>-<n>-<commit>-<time>.log` | Claude's output for each review |
+| `~/.local/share/prk/repos/<org>/<repo>-pr<n>` | The clone while a review runs; deleted afterwards |
 | `~/.config/systemd/user/prk.service` | The service, if installed |
 
-The `~/.local/share/prk` paths move with `workdir`.
+The `~/.local/share/prk` paths move with `workdir`. A full clone of a repo like suchna
+is about 16 MB and takes around 10 seconds.
 
 ---
 
@@ -374,10 +572,12 @@ The `~/.local/share/prk` paths move with `workdir`.
 |---|---|
 | `holds tokens but other users can read it` | `chmod 600 ~/.config/prk/config.toml` |
 | `unknown field ...` | A typo, or a top-level key placed after a `[table]` |
-| `FAIL slack ... invalid_auth` | `slack.app_token` must be the `xapp-` app-level token, not the `xoxb-` bot token |
-| Tagged, but nothing happens | Run `prk --dry-run -v`. Check the app is invited to the channel, `message.channels` is subscribed, and `slack.reviewer` is your member id. Make sure no other process uses the same app token. |
-| `FAIL github` | Token expired, or not approved by the org yet. `prk check` names the account. |
-| `FAIL git ssh` | `ssh -T git@github.com` must greet you; set `github.ssh_key` |
-| Review failed | Open the newest file in `~/.local/share/prk/logs/`. A refused `gh` command there means `/code-review` needed a tool that isn't allowed; add it to `review.allowed_tools`. |
-| `usage limit reached` | The Claude plan's limit is used up; `prk` retries after 30 minutes |
+| `✗ slack ... invalid_auth` | `slack.app_token` must be the `xapp-` app-level token, not the `xoxb-` bot token |
+| `✗ catch-up ... not_in_channel` | `/invite @<your app>` in the channel |
+| `✗ catch-up ... missing_scope` | Add the `channels:history` bot scope and reinstall the app |
+| Tagged, but nothing happens | Run `prk -d -v`. Check the app is invited to the channel, `message.channels` is subscribed, and `slack.reviewer` is your member id. Make sure no other process uses the same app token. |
+| `✗ github` | Token expired, or not approved by the org yet. `prk check` names the account. |
+| `✗ git ssh` | `ssh -T git@github.com` must greet you; set `github.ssh_key` |
+| A review failed | `prk -H <PR url>` shows the reason and the log path. A refused `gh` command in the log means a tool was missing; add it to `review.allowed_tools`. |
+| `Claude usage limit` | The plan's limit is used up; the queue resumes by itself after 30 minutes |
 | `prk: command not found` | Add `~/.cargo/bin` to `PATH`, or run `cargo install --path .` again |

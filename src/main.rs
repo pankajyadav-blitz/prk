@@ -1,60 +1,116 @@
-//! Review GitHub PRs with Claude Code when someone tags the reviewer in Slack.
+//! prk (parikshak): review GitHub PRs with Claude Code when someone tags the
+//! reviewer in Slack.
 //!
-//! Listens to one channel over Socket Mode. A message there that tags
-//! `slack.reviewer` and links PRs from `github.orgs` queues those PRs; a worker
-//! reviews them one at a time with `/code-review --comment`, so the findings land
-//! on the PR as inline comments from the account in `github.token`. Everything --
+//! Listens to one channel over Socket Mode; on start it also catches up on the
+//! requests posted while it was not running. A message that tags
+//! `slack.reviewer` and links PRs from `github.orgs` queues those PRs in the
+//! local database, and a worker reviews them one at a time. Findings land on
+//! the PR as inline comments from the account in `github.token`. Everything --
 //! credentials, review settings, per-repo rules -- comes from one config.toml.
 //!
-//!     prk                      # listen (ctrl-c to stop)
-//!     prk --dry-run -v         # log what would be reviewed
-//!     prk check                # prove every credential works
+//!     prk                      # listen (live dashboard in a terminal)
+//!     prk -H                   # history of reviews
+//!     prk -c <PR url>          # the comments a review posted
 //!     prk review <PR url>      # review one PR now
+//!     prk check                # prove every credential works
 
+mod activity;
+mod catchup;
 mod config;
+mod db;
+mod exec;
+mod github;
 mod log;
 mod review;
+mod setup;
 mod slack;
 mod socket;
-mod state;
 mod stop;
+mod tui;
+mod view;
 
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use crossterm::style::Color;
 
 use crate::config::Config;
-use crate::review::{Failure, Outcome, Reviewer};
+use crate::db::{Db, Enqueued, HistoryFilter};
+use crate::exec::Exec;
+use crate::review::{End, Reviewer};
 use crate::slack::PrRef;
 use crate::stop::Stop;
-
-/// How long to wait before retrying once the Claude account is out of usage.
-const USAGE_LIMIT_PAUSE_SECONDS: f64 = 30.0 * 60.0;
+use crate::view::{bold, dim, paint};
 
 #[derive(Parser)]
 #[command(
     name = "prk",
     version,
-    about = "Review GitHub PRs with Claude Code when someone tags the reviewer in Slack"
+    about = "Review GitHub PRs with Claude Code when someone tags you in Slack",
+    after_help = "Examples:\n  \
+        prk                  listen for review requests (live dashboard in a terminal)\n  \
+        prk -H               recent reviews        prk -H <PR url>   every attempt for one PR\n  \
+        prk -H --today       today's reviews       prk -H --status failed\n  \
+        prk -c <PR url>      comments the latest review of that PR posted\n  \
+        prk --stats          totals: reviewed, skipped, failed, follow-up verdicts\n  \
+        prk review <PR url>  review one PR now (--force to review an already reviewed commit)\n  \
+        prk check            check Slack, GitHub, ssh and Claude\n  \
+        prk setup-token      create a Claude subscription token and save it in the config"
 )]
 struct Cli {
     /// config.toml to read (default: $PRK_CONFIG, then ~/.config/prk/config.toml)
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// log what would be reviewed; run nothing, post nothing
-    #[arg(long = "dry-run", global = true)]
+    /// look PRs up and log what would happen; review and post nothing
+    #[arg(short = 'd', long = "dry-run", global = true)]
     dry_run: bool,
 
-    #[arg(long, short, global = true)]
+    #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// show review history, or every attempt for one PR
+    #[arg(short = 'H', long, num_args = 0..=1, value_name = "PR_URL", conflicts_with_all = ["comments", "stats"])]
+    history: Option<Option<String>>,
+
+    /// show the comments a review posted (the latest review, or the latest of one PR)
+    #[arg(short = 'c', long, num_args = 0..=1, value_name = "PR_URL", conflicts_with = "stats")]
+    comments: Option<Option<String>>,
+
+    /// totals from the history
+    #[arg(long)]
+    stats: bool,
+
+    #[command(flatten)]
+    filter: FilterArgs,
 
     #[command(subcommand)]
     command: Option<Cmd>,
+}
+
+#[derive(Args)]
+struct FilterArgs {
+    /// with -H: how many to show
+    #[arg(short = 'n', long, default_value_t = 20)]
+    limit: usize,
+    /// with -H: only today
+    #[arg(long)]
+    today: bool,
+    /// with -H: only this recent, e.g. 12h, 7d, 2w
+    #[arg(long, value_name = "AGE")]
+    since: Option<String>,
+    /// with -H: only this repo
+    #[arg(short = 'r', long)]
+    repo: Option<String>,
+    /// with -H: only this status (waiting, running, reviewed, skipped, failed)
+    #[arg(short = 's', long)]
+    status: Option<String>,
+    /// with -c: every review of the PR, not only the latest; with -H: no limit
+    #[arg(short = 'a', long)]
+    all: bool,
 }
 
 #[derive(Subcommand)]
@@ -65,9 +121,15 @@ enum Cmd {
     Review {
         /// e.g. https://github.com/Blitzscale-19/suchna/pull/826
         url: String,
-        /// review even if this head commit was reviewed before
-        #[arg(long)]
+        /// a full review even if this commit was reviewed before (no follow-up)
+        #[arg(short, long)]
         force: bool,
+    },
+    /// Create a Claude subscription token (`claude setup-token`) and save it in the config
+    SetupToken {
+        /// save this token instead of running `claude setup-token`
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -80,127 +142,403 @@ fn main() {
     let cli = Cli::parse();
     log::set_verbose(cli.verbose);
     let path = cli.config.clone().unwrap_or_else(config::default_path);
+    // Before loading: the config may still have placeholders the loader refuses.
+    if let Some(Cmd::SetupToken { token }) = &cli.command {
+        if let Err(e) = setup::run(&path, "claude", token.clone()) {
+            die(e);
+        }
+        return;
+    }
     let cfg = Config::load(&path).unwrap_or_else(|e| die(e));
     if let Err(e) = cfg.check_private() {
         die(e);
     }
     debug!("config: {}", path.display());
+    let db = Arc::new(Db::open(&cfg.workdir().join("state.sqlite3")).unwrap_or_else(|e| die(e)));
 
+    if let Some(pr) = &cli.history {
+        return show_history(&db, pr.as_deref(), &cli.filter);
+    }
+    if let Some(pr) = &cli.comments {
+        return show_comments(&db, pr.as_deref(), cli.filter.all);
+    }
+    if cli.stats {
+        return view::stats(&db);
+    }
     match cli.command {
         Some(Cmd::Check) => std::process::exit(check(&cfg)),
-        Some(Cmd::Review { url, force }) => {
-            let pr =
-                PrRef::parse(&url).unwrap_or_else(|| die(format!("not a GitHub PR url: {url}")));
-            let reviewer = Reviewer::new(cfg, cli.dry_run).unwrap_or_else(|e| die(e));
-            let stop = Arc::new(Stop::default());
-            install_signal_handlers(stop.clone());
-            if !review_one(&reviewer, &pr, force, &stop) {
-                std::process::exit(1);
+        Some(Cmd::Review { url, force }) => review_now(cfg, db, &url, force, cli.dry_run),
+        Some(Cmd::SetupToken { .. }) => unreachable!("handled before the config is loaded"),
+        None => listen(cfg, db, cli.dry_run),
+    }
+}
+
+fn parse_pr(url: &str) -> PrRef {
+    PrRef::parse(url).unwrap_or_else(|| die(format!("not a GitHub PR url: {url}")))
+}
+
+fn history_filter(f: &FilterArgs) -> HistoryFilter {
+    let since = if f.today {
+        Some(
+            chrono::Local::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
+                .map(|t| t.timestamp())
+                .unwrap_or(0),
+        )
+    } else {
+        f.since.as_deref().map(|s| {
+            db::now()
+                - view::parse_since(s).unwrap_or_else(|| {
+                    die(format!(
+                        "--since {s}: use a number and m, h, d or w, e.g. 7d"
+                    ))
+                })
+        })
+    };
+    HistoryFilter {
+        limit: if f.all { 0 } else { f.limit },
+        since,
+        repo: f.repo.clone(),
+        status: f.status.clone(),
+        pr: None,
+    }
+}
+
+fn show_history(db: &Arc<Db>, pr: Option<&str>, f: &FilterArgs) {
+    let mut filter = history_filter(f);
+    if let Some(url) = pr {
+        let pr = parse_pr(url);
+        filter.pr = Some((pr.owner, pr.repo, pr.number));
+        filter.limit = 0;
+        return view::history_of_pr(db, &db.history(&filter));
+    }
+    if std::io::stdout().is_terminal() {
+        filter.limit = 0;
+        if let Err(e) = tui::history(db.clone(), filter) {
+            die(format!("history screen: {e}"));
+        }
+        return;
+    }
+    view::history(&db.history(&filter));
+}
+
+fn show_comments(db: &Db, pr: Option<&str>, all: bool) {
+    let mut filter = HistoryFilter {
+        status: Some(db::REVIEWED.into()),
+        limit: if all { 0 } else { 1 },
+        ..Default::default()
+    };
+    if let Some(url) = pr {
+        let pr = parse_pr(url);
+        filter.pr = Some((pr.owner, pr.repo, pr.number));
+    }
+    let mut jobs = db.history(&filter);
+    if jobs.is_empty() {
+        println!(
+            "No finished reviews{} yet.",
+            if pr.is_some() { " of that PR" } else { "" }
+        );
+        return;
+    }
+    jobs.reverse();
+    for (i, job) in jobs.iter().enumerate() {
+        if i > 0 {
+            println!("\n{}\n", dim(&"─".repeat(40)));
+        }
+        view::comments(job, &db.comments(job.id));
+    }
+}
+
+/// `prk review <url>`: queue the PR and review it here, showing each step.
+fn review_now(cfg: Config, db: Arc<Db>, url: &str, force: bool, dry_run: bool) {
+    let pr = parse_pr(url);
+    let id = match db
+        .enqueue(&pr.owner, &pr.repo, pr.number, "", "", "manual", force)
+        .unwrap_or_else(|e| die(e))
+    {
+        Enqueued::New(id) | Enqueued::Seen(id) => id,
+        Enqueued::Pending(id, status) if status == db::WAITING => id,
+        Enqueued::Pending(_, _) => die(format!(
+            "{} is being reviewed right now (see `prk -H {url}`)",
+            pr.key()
+        )),
+    };
+    if !db.claim(id).unwrap_or_else(|e| die(e)) {
+        die(format!(
+            "{} was just taken by the running listener",
+            pr.key()
+        ));
+    }
+    let job = db
+        .job(id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| die("job vanished"));
+    let stop = Arc::new(Stop::default());
+    install_signal_handlers(stop.clone());
+    let reviewer = Reviewer::new(cfg, db.clone(), dry_run);
+
+    println!("{} {}", bold(&pr.key()), dim(&pr.url()));
+    let worker = {
+        let stop = stop.clone();
+        let job = job.clone();
+        std::thread::spawn(move || reviewer.process(&job, &stop))
+    };
+    follow_steps(&worker);
+    let end = worker
+        .join()
+        .unwrap_or(End::Failed("review thread crashed".into()));
+    let job = db.job(id).ok().flatten().unwrap_or(job);
+    let (glyph, color) = view::status_look(&job.status);
+    let summary = match &end {
+        End::Reviewed(why) => format!("{} {}", view::status_word(&job), why),
+        End::Skipped(why) => format!("skipped: {why}"),
+        End::Retry(why) | End::Failed(why) => format!("failed: {why}"),
+        End::UsageLimit(why) => format!("Claude usage limit: {why}"),
+        End::Stopped => "stopped".to_string(),
+    };
+    println!(
+        "{} {}  {}",
+        paint(glyph, color),
+        paint(&summary, color),
+        dim(&view::took(job.took()))
+    );
+    if matches!(end, End::Reviewed(_)) {
+        println!();
+        view::comments(&job, &db.comments(job.id));
+    }
+    if !job.log.is_empty() {
+        println!("{}", dim(&format!("log: {}", job.log)));
+    }
+    if matches!(end, End::Retry(_) | End::Failed(_) | End::UsageLimit(_)) {
+        std::process::exit(1);
+    }
+}
+
+/// Print each step of the review as it changes; in a terminal the current step
+/// carries a spinner and its elapsed time.
+fn follow_steps(worker: &std::thread::JoinHandle<End>) {
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tty = std::io::stdout().is_terminal();
+    let mut current: Option<(String, i64)> = None;
+    let mut tick = 0usize;
+    let finish = |step: &str, since: i64| {
+        let line = format!(
+            "{} {:<20} {}",
+            paint("✓", Color::Green),
+            step,
+            dim(&view::took(db::now() - since))
+        );
+        if tty {
+            print!("\r\x1b[2K{line}\n");
+        } else {
+            println!("{line}");
+        }
+    };
+    loop {
+        let step = activity::get().step().map(|(_, s, since)| (s, since));
+        if step.as_ref().map(|s| &s.0) != current.as_ref().map(|s| &s.0) {
+            if let Some((s, since)) = &current {
+                finish(s, *since);
             }
+            current = step;
         }
-        None => listen(cfg, cli.dry_run),
+        if worker.is_finished() {
+            if let Some((s, since)) = &current {
+                finish(s, *since);
+            }
+            break;
+        }
+        if tty && let Some((s, since)) = &current {
+            print!(
+                "\r\x1b[2K{} {:<20} {}",
+                paint(SPIN[tick % SPIN.len()], Color::Cyan),
+                s,
+                dim(&view::took(db::now() - since))
+            );
+            let _ = std::io::stdout().flush();
+        }
+        tick += 1;
+        std::thread::sleep(std::time::Duration::from_millis(120));
     }
 }
 
-/// Review one PR and log the outcome. True unless it failed.
-fn review_one(reviewer: &Reviewer, pr: &PrRef, force: bool, stop: &Stop) -> bool {
-    match reviewer.review(pr, force, stop) {
-        Ok(Outcome::Reviewed { log }) => {
-            info!("reviewed {}; output in {}", pr.key(), log.display());
-            true
-        }
-        Ok(Outcome::Skipped(why)) => {
-            info!("skipped {}: {why}", pr.key());
-            true
-        }
-        Ok(Outcome::DryRun) => {
-            info!("dry run: would review {} now", pr.url());
-            true
-        }
-        Err(Failure::UsageLimit(why)) => {
-            error!("{}: Claude usage limit reached: {why}", pr.key());
-            false
-        }
-        Err(Failure::Failed(why)) => {
-            error!("{} failed: {why}", pr.key());
-            false
-        }
-    }
-}
-
-fn listen(cfg: Config, dry_run: bool) {
+/// The listener: Slack events and catch-up queue jobs, a worker reviews them.
+fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
+    let tty = std::io::stdout().is_terminal();
     let channel = cfg.slack.channel.clone();
     let reviewer_id = cfg.slack.reviewer.clone();
     let orgs = cfg.github.orgs.clone();
     let app_token = cfg.slack.app_token.clone();
+    let bot_token = cfg.slack.bot_token.clone();
+    let catch_up_hours = cfg.slack.catch_up_hours;
+    let timeout_minutes = cfg.review.timeout_minutes;
+    if tty {
+        activity::get().set_tui(true);
+    }
     if dry_run {
         warn!("DRY RUN -- PRs are looked up but not reviewed");
     }
-    let reviewer = Reviewer::new(cfg, dry_run).unwrap_or_else(|e| die(e));
 
+    let recovered = db.recover();
+    if recovered > 0 {
+        info!("{recovered} interrupted review(s) queued again");
+    }
+    let reviewer = Reviewer::new(cfg.clone(), db.clone(), dry_run);
+    if db.running().is_empty() {
+        reviewer.clean_repos();
+    }
     let stop = Arc::new(Stop::default());
     install_signal_handlers(stop.clone());
 
-    // Reviews take minutes, so they run on their own thread and the socket only
-    // queues them; one at a time keeps the Claude usage predictable.
-    let (queue, jobs) = mpsc::channel::<PrRef>();
+    // Where catch-up starts, taken before the listener moves the cursor on.
+    let oldest = catchup::oldest(db.cursor(&channel), catch_up_hours, db::now() as f64);
+
+    let queue = {
+        let db = db.clone();
+        let channel = channel.clone();
+        let reviewer_id = reviewer_id.clone();
+        move |event: &serde_json::Value, source: &str| -> bool {
+            if let Some(ts) = event.get("ts").and_then(|t| t.as_str())
+                && event.get("channel").and_then(|c| c.as_str()) == Some(channel.as_str())
+            {
+                db.set_cursor(&channel, ts);
+            }
+            let Some(request) = slack::request(event, &channel, &reviewer_id, &orgs) else {
+                return false;
+            };
+            let mut queued = false;
+            for pr in &request.prs {
+                match db.enqueue(
+                    &pr.owner,
+                    &pr.repo,
+                    pr.number,
+                    &request.user,
+                    &request.ts,
+                    source,
+                    false,
+                ) {
+                    Ok(Enqueued::New(_)) => {
+                        info!("queued {} (asked by {}, {source})", pr.key(), request.user);
+                        queued = true;
+                    }
+                    Ok(Enqueued::Pending(_, status)) => info!("{} is already {status}", pr.key()),
+                    Ok(Enqueued::Seen(_)) => debug!(
+                        "{} from message {} already queued once",
+                        pr.key(),
+                        request.ts
+                    ),
+                    Err(e) => error!("could not queue {}: {e}", pr.key()),
+                }
+            }
+            queued
+        }
+    };
+    let queue = Arc::new(queue);
+
+    let listener = {
+        let stop = stop.clone();
+        let queue = queue.clone();
+        std::thread::spawn(move || {
+            socket::run(
+                &app_token,
+                &|event| {
+                    queue(event, "slack");
+                },
+                &stop,
+            )
+        })
+    };
+
+    if bot_token.is_empty() || catch_up_hours == 0 {
+        if bot_token.is_empty() {
+            info!("no slack.bot_token, so no catch-up on requests posted while prk was off");
+        }
+    } else {
+        let queue = queue.clone();
+        let channel = channel.clone();
+        std::thread::spawn(
+            move || match catchup::messages(&bot_token, &channel, oldest) {
+                Ok(messages) => {
+                    let n = messages.iter().filter(|m| queue(m, "catch-up")).count();
+                    info!(
+                        "caught up on {} message(s) since {}: {n} new request(s)",
+                        messages.len(),
+                        view::when(oldest as i64)
+                    );
+                    activity::get().set_caught_up(Ok(n));
+                }
+                Err(e) => {
+                    warn!("catch-up failed: {e}");
+                    activity::get().set_caught_up(Err(e));
+                }
+            },
+        );
+    }
+
     let worker = {
         let stop = stop.clone();
+        let db = db.clone();
         std::thread::spawn(move || {
             while !stop.is_set() {
-                let Ok(pr) = jobs.recv_timeout(Duration::from_secs(1)) else {
+                let a = activity::get();
+                if a.paused() || a.held().is_some() {
+                    stop.wait(1.0);
                     continue;
-                };
-                loop {
-                    match reviewer.review(&pr, false, &stop) {
-                        Err(Failure::UsageLimit(why)) if !stop.is_set() => {
-                            warn!(
-                                "{}: Claude usage limit reached ({why}); pausing reviews for {} minutes",
-                                pr.key(),
-                                USAGE_LIMIT_PAUSE_SECONDS / 60.0
-                            );
-                            stop.wait(USAGE_LIMIT_PAUSE_SECONDS);
-                        }
-                        other => {
-                            match other {
-                                Ok(Outcome::Reviewed { log }) => {
-                                    info!("reviewed {}; output in {}", pr.key(), log.display())
-                                }
-                                Ok(Outcome::Skipped(why)) => info!("skipped {}: {why}", pr.key()),
-                                Ok(Outcome::DryRun) => info!("dry run: would review {}", pr.url()),
-                                Err(Failure::Failed(why)) | Err(Failure::UsageLimit(why)) => {
-                                    error!("{} failed: {why}", pr.key())
-                                }
-                            }
-                            break;
-                        }
+                }
+                let job = match db.claim_next() {
+                    Ok(Some(job)) => job,
+                    Ok(None) => {
+                        stop.wait(1.0);
+                        continue;
                     }
+                    Err(e) => {
+                        error!("queue: {e}");
+                        stop.wait(5.0);
+                        continue;
+                    }
+                };
+                match reviewer.process(&job, &stop) {
+                    End::Reviewed(why) => info!(
+                        "{} {}: {why}",
+                        if job.kind == "follow-up" {
+                            "followed up"
+                        } else {
+                            "reviewed"
+                        },
+                        job.key()
+                    ),
+                    End::Skipped(why) => info!("skipped {}: {why}", job.key()),
+                    End::Retry(why) => warn!("{} failed, will retry: {why}", job.key()),
+                    End::Failed(why) => error!("{} failed: {why}", job.key()),
+                    End::UsageLimit(why) => {
+                        warn!("Claude usage limit reached ({why}); pausing reviews for 30 minutes");
+                        a.pause_until(
+                            db::now() + review::USAGE_LIMIT_SECONDS,
+                            "Claude usage limit",
+                        );
+                    }
+                    End::Stopped => {}
                 }
             }
         })
     };
 
-    info!("watching {channel} for tags of {reviewer_id} (ctrl-c to stop)");
-    let on_event = move |event: &serde_json::Value| {
-        let Some(request) = slack::request(event, &channel, &reviewer_id, &orgs) else {
-            return;
-        };
-        for pr in request.prs {
-            info!(
-                "{} asked for a review of {} (message {})",
-                request.user,
-                pr.key(),
-                request.ts
-            );
-            let _ = queue.send(pr);
+    info!("watching {channel} for tags of {reviewer_id}");
+    if tty {
+        if let Err(e) = tui::dashboard(db, &channel, &reviewer_id, timeout_minutes, stop.clone()) {
+            activity::get().set_tui(false);
+            error!("dashboard: {e}");
         }
-    };
-    let listener = {
-        let stop = stop.clone();
-        std::thread::spawn(move || socket::run(&app_token, &on_event, &stop))
-    };
-    stop.wait_forever();
-    info!("stopping");
+        stop.set();
+        activity::get().set_tui(false);
+        eprintln!("stopping; an interrupted review is queued again for the next start");
+    } else {
+        stop.wait_forever();
+        info!("stopping");
+    }
     let _ = worker.join();
     // The listener may sit in a 45s socket read; the process is exiting anyway.
     drop(listener);
@@ -210,14 +548,19 @@ fn listen(cfg: Config, dry_run: bool) {
 fn check(cfg: &Config) -> i32 {
     let mut failed = 0;
     let mut report = |name: &str, result: Result<String, String>| match result {
-        Ok(detail) => println!("ok    {name:<8} {detail}"),
+        Ok(detail) => println!("{} {:<9} {detail}", paint("✓", Color::Green), name),
         Err(why) => {
             failed += 1;
-            println!("FAIL  {name:<8} {why}");
+            println!(
+                "{} {:<9} {}",
+                paint("✗", Color::Red),
+                name,
+                paint(&why, Color::Red)
+            );
         }
     };
 
-    println!("config   {}", cfg.source.display());
+    println!("{}", dim(&format!("config {}", cfg.source.display())));
     report(
         "slack",
         socket::open_connection(&cfg.slack.app_token).map(|_| {
@@ -227,13 +570,31 @@ fn check(cfg: &Config) -> i32 {
             )
         }),
     );
+    report(
+        "catch-up",
+        if cfg.slack.bot_token.is_empty() {
+            Ok("off (no slack.bot_token): requests posted while prk is off are missed".into())
+        } else if cfg.slack.catch_up_hours == 0 {
+            Ok("off (catch_up_hours = 0)".into())
+        } else {
+            catchup::messages(
+                &cfg.slack.bot_token,
+                &cfg.slack.channel,
+                db::now() as f64 - 3600.0,
+            )
+            .map(|_| {
+                format!(
+                    "bot token reads the channel; catches up {}h back",
+                    cfg.slack.catch_up_hours
+                )
+            })
+        },
+    );
 
-    let reviewer = Reviewer::new(cfg.clone(), true).unwrap_or_else(|e| die(e));
-    let mut gh = Command::new("gh");
-    gh.args(["api", "user", "--jq", ".login"]);
+    let exec = Exec { cfg: cfg.clone() };
     report(
         "github",
-        output(reviewer.env_for(gh)).map(|login| format!("comments will be posted as {login}")),
+        github::login(&exec).map(|login| format!("comments will be posted as {login}")),
     );
 
     let mut ssh = Command::new("git");
@@ -247,7 +608,7 @@ fn check(cfg: &Config) -> i32 {
     ]);
     report(
         "git ssh",
-        probe_ssh(reviewer.env_for(ssh), &cfg.github.ssh_host),
+        probe_ssh(exec.env_for(ssh), &cfg.github.ssh_host),
     );
 
     let mut claude = Command::new(&cfg.claude.bin);
@@ -261,12 +622,15 @@ fn check(cfg: &Config) -> i32 {
     };
     report(
         "claude",
-        output(reviewer.env_for(claude)).map(|v| format!("{} via {auth}", v.trim())),
+        output(exec.env_for(claude)).map(|v| format!("{} via {auth}", v.trim())),
     );
 
-    let repos: Vec<&String> = cfg.rules.repos.keys().collect();
+    let mut repos: Vec<&String> = cfg.rules.repos.keys().collect();
+    repos.sort();
     println!(
-        "rules    all: {}; repos: {}",
+        "{} {:<9} all: {}; repos: {}",
+        dim("·"),
+        "rules",
         if cfg.rules.all.trim().is_empty() {
             "none"
         } else {

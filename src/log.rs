@@ -1,4 +1,5 @@
-//! One-line, timestamped log to stderr. Debug lines only with --verbose.
+//! One-line, timestamped log to stderr; debug lines only with --verbose. While
+//! the dashboard owns the terminal, lines go to its log panel instead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,7 +13,12 @@ pub fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
-pub fn emit(level: &str, message: &str) {
+pub fn emit(level: &'static str, message: &str) {
+    let activity = crate::activity::get();
+    if activity.tui() {
+        activity.push_log(level, message);
+        return;
+    }
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     eprintln!("{now} {level:<5} {message}");
 }

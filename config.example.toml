@@ -15,6 +15,13 @@ channel = "CPWCB54G2"
 # YOUR Slack member id: profile -> ⋮ -> Copy member ID. A message in the channel
 # that tags this id and links a PR starts a review.
 reviewer = "U0XXXXXXXXX"
+# The app's Bot User OAuth Token (xoxb-..., scope channels:history). With it, every
+# start catches up on review requests posted while prk was not running. Empty =
+# no catch-up: only requests posted while prk runs are seen.
+bot_token = ""
+# How far back a start may catch up, in hours (it starts after the last message
+# prk saw, but never earlier than this). 0 = no catch-up. 72 covers a weekend.
+catch_up_hours = 24
 
 [github]
 # Fine-grained token from YOUR GitHub account: Blitzscale-19 repos,
@@ -31,6 +38,7 @@ orgs = ["Blitzscale-19"]
 [claude]
 # ONE of these. Both empty = this machine's `claude` login.
 # From `claude setup-token`: uses your Claude subscription's usage limits.
+# `prk setup-token` runs it and saves the token here for you.
 oauth_token = ""
 # From console.anthropic.com: billed per token.
 api_key = ""
@@ -48,6 +56,15 @@ max_budget_usd = 2
 timeout_minutes = 30
 # Review draft PRs too.
 drafts = false
+# false: clone fresh for every review and delete the clone afterwards (saves disk).
+# true: keep one clone per repo under workdir/repos and reuse it (faster reviews).
+keep_repos = false
+# When a PR prk reviewed gets new commits and is tagged again: true = a follow-up
+# (check each earlier comment, reply fixed / still present / partly fixed, review
+# only what changed, post a summary); false = a full review again.
+follow_up = true
+# true = review each PR once only; later tags after new commits are skipped.
+once_per_pr = false
 # Tools the review may use. Leave unset for the built-in list: read and search the
 # checkout, read git history, and gh limited to the one PR under review (its view,
 # diff, files, comments and reviews). No file edits, no web, no other PRs or repos,

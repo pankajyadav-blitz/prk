@@ -20,7 +20,7 @@ pub struct Config {
     pub source: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SlackCfg {
     /// xapp- app-level token with connections:write (Socket Mode).
@@ -29,6 +29,23 @@ pub struct SlackCfg {
     pub channel: String,
     /// Slack member id whose tag triggers a review.
     pub reviewer: String,
+    /// xoxb- bot token with channels:history. With it, a start catches up on
+    /// requests posted while prk was not running. Empty = no catch-up.
+    pub bot_token: String,
+    /// How far back a start may catch up, in hours. 0 = no catch-up.
+    pub catch_up_hours: u64,
+}
+
+impl Default for SlackCfg {
+    fn default() -> Self {
+        SlackCfg {
+            app_token: String::new(),
+            channel: String::new(),
+            reviewer: String::new(),
+            bot_token: String::new(),
+            catch_up_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +106,14 @@ pub struct ReviewCfg {
     pub timeout_minutes: u64,
     /// Review draft PRs too.
     pub drafts: bool,
+    /// Keep each repo's clone between reviews (faster, uses disk). Off: every
+    /// review clones fresh and deletes the clone when it finishes.
+    pub keep_repos: bool,
+    /// After new commits on a reviewed PR, check the earlier comments and review
+    /// only what changed, instead of a full review again.
+    pub follow_up: bool,
+    /// Review each PR once only; later tags after new commits are skipped.
+    pub once_per_pr: bool,
     /// Tools the review may use. Empty = the built-in read-and-comment list.
     pub allowed_tools: Vec<String>,
 }
@@ -100,6 +125,9 @@ impl Default for ReviewCfg {
             max_budget_usd: 2.0,
             timeout_minutes: 30,
             drafts: false,
+            keep_repos: false,
+            follow_up: true,
+            once_per_pr: false,
             allowed_tools: Vec::new(),
         }
     }
@@ -211,6 +239,11 @@ impl Config {
                 "{at}: slack.reviewer must be a Slack member id (U...), from profile -> ⋮ -> Copy member ID"
             ));
         }
+        if !self.slack.bot_token.is_empty() && !self.slack.bot_token.starts_with("xoxb-") {
+            return Err(format!(
+                "{at}: slack.bot_token must be the app's xoxb- bot token (or empty)"
+            ));
+        }
         if self.github.orgs.is_empty() {
             return Err(format!(
                 "{at}: github.orgs is empty, so no PR link would ever match"
@@ -315,6 +348,11 @@ mod tests {
         assert_eq!(cfg.github.orgs, vec!["Blitzscale-19"]);
         assert_eq!(cfg.github.ssh_host, "github.com");
         assert_eq!(cfg.claude.bin, "claude");
+        assert!(!cfg.review.keep_repos);
+        assert!(cfg.review.follow_up);
+        assert!(!cfg.review.once_per_pr);
+        assert_eq!(cfg.slack.catch_up_hours, 24);
+        assert!(cfg.slack.bot_token.is_empty());
         let tools = cfg.allowed_tools("Blitzscale-19", "suchna", 823);
         assert!(tools.contains(&"Bash(gh pr diff 823:*)".to_string()));
         assert!(
@@ -368,6 +406,7 @@ mod tests {
                 .is_err()
         );
         assert!(parse(&format!("{MINIMAL}[review]\nlevel = \"max\"\n")).is_err());
+        assert!(parse(&MINIMAL.replace("reviewer", "bot_token = \"xapp-2\"\nreviewer")).is_err());
         assert!(
             parse(&format!(
                 "{MINIMAL}[claude]\noauth_token = \"a\"\napi_key = \"b\"\n"

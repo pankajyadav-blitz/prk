@@ -106,6 +106,7 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
         if attempt > 0 {
             crate::info!("reconnected to Slack");
         }
+        crate::activity::get().set_connected(true);
         attempt = 0;
         debug!("socket: connected");
         // Slack pings every ~30s, so this only fires on a dead link.
@@ -140,6 +141,7 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
             }
         }
         let _ = socket.close(None);
+        crate::activity::get().set_connected(false);
         if !stop.is_set() {
             stop.wait(1.0);
         }
