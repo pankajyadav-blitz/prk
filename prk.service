@@ -1,0 +1,22 @@
+# systemd user service. Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp prk.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now prk
+#   loginctl enable-linger "$USER"     # keep it running after you log out (servers)
+# Logs: journalctl --user -u prk -f
+
+[Unit]
+Description=Review GitHub PRs with Claude Code when tagged in Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/prk
+Restart=always
+RestartSec=10
+# gh, git and claude must be on this PATH.
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

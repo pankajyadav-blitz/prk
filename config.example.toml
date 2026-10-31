@@ -1,0 +1,86 @@
+# prk config. Copy to ~/.config/prk/config.toml, fill in your
+# own values, then: chmod 600 ~/.config/prk/config.toml
+# The bot refuses to run while other users can read this file (it holds tokens).
+
+# Repo clones, logs and the review state database. Top-level keys must come
+# before the first [table], or TOML files them under that table.
+workdir = "~/.local/share/prk"
+
+[slack]
+# App-level token (xapp-...) with connections:write, for Socket Mode. The app must be
+# in the channel (/invite @app) and subscribed to the message.channels bot event.
+app_token = "xapp-..."
+# Channel id to watch (#peer-review).
+channel = "CPWCB54G2"
+# YOUR Slack member id: profile -> ⋮ -> Copy member ID. A message in the channel
+# that tags this id and links a PR starts a review.
+reviewer = "U0XXXXXXXXX"
+
+[github]
+# Fine-grained token from YOUR GitHub account: Blitzscale-19 repos,
+# Pull requests read/write, Contents read. Review comments are posted as this
+# account. Empty = this machine's `gh auth login`.
+token = "github_pat_..."
+# Key git clones and fetches with. Empty = this machine's ssh setup.
+ssh_key = "~/.ssh/id_ed25519"
+# Host in git@<host>:org/repo.git; an ~/.ssh/config alias works too.
+ssh_host = "github.com"
+# PR links outside these owners are ignored.
+orgs = ["Blitzscale-19"]
+
+[claude]
+# ONE of these. Both empty = this machine's `claude` login.
+# From `claude setup-token`: uses your Claude subscription's usage limits.
+oauth_token = ""
+# From console.anthropic.com: billed per token.
+api_key = ""
+# Empty = Claude Code's default model.
+model = ""
+
+[review]
+# /code-review depth: low, medium, high or xhigh. Deeper finds more, costs more,
+# and posts more comments (some less certain).
+level = "medium"
+# Stop one review once its estimated cost passes this. With an API key this is real
+# money; with a subscription it only caps how big one review can get. 0 = no cap.
+max_budget_usd = 2
+# Kill a review still running after this long and move on to the next PR.
+timeout_minutes = 30
+# Review draft PRs too.
+drafts = false
+# Tools the review may use. Leave unset for the built-in list: read and search the
+# checkout, read git history, and gh limited to the one PR under review (its view,
+# diff, files, comments and reviews). No file edits, no web, no other PRs or repos,
+# no merge. {owner}, {repo} and {number} are filled in for each PR.
+# allowed_tools = ["Read", "Grep", "Glob", "Bash(gh pr diff {number}:*)",
+#                  "Bash(gh api repos/{owner}/{repo}/pulls/{number}/comments:*)"]
+
+# Review rules. Claude treats a violation in the changed code as a finding and names
+# the rule it breaks. `all` applies to every repo; [rules.repos.<repo name>] adds
+# rules for that repo only. A repo with no table gets only `all`.
+[rules]
+all = """
+- Flag any secret, token, password or private key committed in code or config.
+- Flag debugging leftovers (console.log, print, commented-out blocks) in production code.
+"""
+
+[rules.repos.suchna]
+rules = """
+- Every route handler is wrapped in asyncWrapper(...) so async errors reach the error middleware.
+- Layering: routes -> controller -> service -> dao. Controllers stay thin; business logic lives in
+  services; only DAOs touch Sequelize models (DB.<Model>).
+- No `any` and no unsafe casts; ESLint's no-explicit-any and no-unsafe-* rules are errors here.
+- Read config only through `@/config`; never read nconf or process.env anywhere else.
+- DAO reads of soft-deletable tables filter is_active: true.
+- Schema changes need a sequelize-cli migration in src/migrations; data backfills go in a new
+  self-contained file in src/evolutions, never by editing an existing one.
+- HTTP calls use fetch/forceFetch from sarthi.util, not raw node-fetch.
+- Throw the error classes from src/utils/util.ts (HandledError, ValidationError, NotFoundError).
+- Request validation uses Zod validators attached as route middleware.
+- Use enums and constants from src/constants instead of repeated string literals.
+"""
+
+# [rules.repos.alfred]
+# rules = """
+# - ...
+# """
