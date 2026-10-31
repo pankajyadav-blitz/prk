@@ -56,7 +56,7 @@ You need these on the machine that runs `prk`:
 |---|---|---|
 | Rust (cargo) | `cargo --version` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | git | `git --version` | your package manager |
-| GitHub CLI | `gh --version` | https://cli.github.com |
+| GitHub CLI | `gh --version` | https://cli.github.com (installed is enough: **no `gh auth login` needed**, `prk` gives it the token from `github.token`) |
 | Claude Code | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
 
 Then build and install `prk`:

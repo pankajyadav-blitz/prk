@@ -173,6 +173,40 @@ fn main() {
     }
 }
 
+/// gh, git and claude must be installed before anything is queued or run: a
+/// missing one would only show up mid-review, as a failure no retry can fix.
+/// gh needs no login; the token in the config is enough.
+fn require_tools(cfg: &Config) {
+    let tools = [
+        (
+            "gh",
+            "gh",
+            "https://cli.github.com (no `gh auth login` needed: github.token is used)",
+        ),
+        ("git", "git", "your package manager"),
+        (
+            "claude",
+            cfg.claude.bin.as_str(),
+            "npm install -g @anthropic-ai/claude-code",
+        ),
+    ];
+    let missing: Vec<String> = tools
+        .iter()
+        .filter(|(_, bin, _)| {
+            Command::new(bin)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_err()
+        })
+        .map(|(name, bin, how)| format!("  {name} ({bin}): install from {how}"))
+        .collect();
+    if !missing.is_empty() {
+        die(format!("prk needs these on PATH:\n{}", missing.join("\n")));
+    }
+}
+
 fn parse_pr(url: &str) -> PrRef {
     PrRef::parse(url).unwrap_or_else(|| die(format!("not a GitHub PR url: {url}")))
 }
@@ -254,6 +288,7 @@ fn show_comments(db: &Db, pr: Option<&str>, all: bool) {
 /// `prk review <url>`: queue the PR and review it here, showing each step.
 fn review_now(cfg: Config, db: Arc<Db>, url: &str, force: bool, dry_run: bool) {
     let pr = parse_pr(url);
+    require_tools(&cfg);
     let id = match db
         .enqueue(&pr.owner, &pr.repo, pr.number, "", "", "manual", force)
         .unwrap_or_else(|e| die(e))
@@ -377,6 +412,7 @@ fn follow_steps(worker: &std::thread::JoinHandle<End>) {
 
 /// The listener: Slack events and catch-up queue jobs, a worker reviews them.
 fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
+    require_tools(&cfg);
     let tty = std::io::stdout().is_terminal();
     let channel = cfg.slack.channel.clone();
     let reviewer_id = cfg.slack.reviewer.clone();
