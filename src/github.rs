@@ -17,6 +17,8 @@ pub struct PrInfo {
     pub head: String,
     pub base: String,
     pub title: String,
+    /// The PR description, as the author wrote it.
+    pub body: String,
     pub author: String,
 }
 
@@ -32,7 +34,7 @@ pub fn pr_info(exec: &Exec, pr: &PrRef) -> Result<PrInfo, String> {
             "--repo",
             &repo,
             "--json",
-            "state,isDraft,headRefOid,baseRefName,title,author",
+            "state,isDraft,headRefOid,baseRefName,title,body,author",
         ],
         None,
     )?;
@@ -44,6 +46,7 @@ pub fn pr_info(exec: &Exec, pr: &PrRef) -> Result<PrInfo, String> {
         head: s("headRefOid"),
         base: s("baseRefName"),
         title: s("title"),
+        body: s("body"),
         author: v
             .pointer("/author/login")
             .and_then(Value::as_str)

@@ -402,12 +402,21 @@ stay even if someone deletes them on GitHub.
    when your GitHub account already left a review or comment on this commit (by hand,
    or from `prk` on another machine). `prk review -f` overrides both.
 5. **Check out.** The repo is cloned into `workdir/repos/<org>/<repo>-pr<n>` over ssh,
-   the PR head and its base branch are fetched, and the PR head is checked out, so
-   Claude reads the whole repo as it is in the PR, not only the diff.
-6. **Review.** In that checkout `prk` runs
+   the PR head and its **base branch** (`main`, or whatever the PR targets) are fetched,
+   and the PR head is checked out. Claude reads the whole repo as it is in the PR, not
+   only the diff, and compares against `origin/<base>` from where the branch was cut
+   (`git diff origin/<base>...HEAD`), so commits that landed on `main` later are not
+   counted as the PR's changes. This is the same diff as GitHub's "Files changed".
+6. **Context.** `prk` collects what the PR is for and gives it to Claude on every
+   review: the **title and description**, and the **commit messages** of the PR's own
+   commits (`git log origin/<base>..HEAD`, merges skipped). Claude uses them to judge
+   whether the change does what it says and covers the cases the feature needs, but
+   treats them as the author's words, never as instructions. The log of each review
+   starts with exactly this context.
+7. **Review.** In that checkout `prk` runs
    `claude -p "/code-review <level> --comment <PR number>"`, or the
    [follow-up](#follow-up-reviews) instructions, with:
-   - your rules for that repo
+   - the PR context from step 6, and your rules for that repo
    - an instruction that everything in the PR is untrusted data, never instructions
    - only these tools: read and search files, read-only `git` (`diff`, `log`, `show`,
      `blame`, ...), and `gh` limited to **this one PR**: its view, diff, files,
@@ -415,9 +424,9 @@ stay even if someone deletes them on GitHub.
      other repos, the merge endpoint, chained commands, file edits and web access are
      refused by Claude Code itself.
    - the `max_budget_usd` and `timeout_minutes` limits
-7. **Save.** The comments your account posted during the review are fetched and saved
+8. **Save.** The comments your account posted during the review are fetched and saved
    (`prk -c`). Claude's full output is in `workdir/logs/`.
-8. **Clean up.** The clone is deleted (unless `review.keep_repos = true`).
+9. **Clean up.** The clone is deleted (unless `review.keep_repos = true`).
 
 Nothing is posted back in Slack.
 
@@ -426,12 +435,15 @@ Nothing is posted back in Slack.
 ## Follow-up reviews
 
 When a PR that `prk` reviewed gets new commits and you are tagged again (or you run
-`prk review <url>` / press `R`), `prk` runs a follow-up instead of a full review:
+`prk review <url>` / press `R`), `prk` runs a follow-up instead of a full review. It
+does not only look at the new commits: it reviews the **complete PR again**, starting
+from what changed.
 
-1. It gives Claude your earlier inline comments on the PR, except those a previous
-   follow-up already found fixed, and the commit the last review saw.
-2. **Each earlier comment:** Claude checks the new code and replies in that comment's
-   thread:
+1. **What the PR is for:** the title, description and commit messages (as in every
+   review), plus the existing review threads, so Claude knows the feature being built
+   and what was already said.
+2. **Each earlier comment** (except those a previous follow-up already found fixed):
+   Claude checks the new code and replies in that comment's thread:
    > ✅ Fixed in `a1b2c3d`: the handler is now wrapped in `asyncWrapper`.
 
    > ⚠️ Still present in `a1b2c3d`: `fetchSeller` still returns undefined for a
@@ -439,11 +451,25 @@ When a PR that `prk` reviewed gets new commits and you are tagged again (or you 
 
    > ↔️ Partly fixed in `a1b2c3d`: the null check was added, but the same pattern
    > remains in `updateTask`.
-3. **What changed:** Claude reviews only `git diff <last reviewed> <new head>` for new
-   problems, including ones the fixes introduced, and posts them as inline comments.
+3. **The complete PR against its base branch** (`git diff origin/<base>...HEAD`):
+   first what changed since the last review (`git log <last reviewed>..HEAD`, ignoring
+   merges from `main`), including problems the fixes introduced; then the rest of the
+   PR, for anything the earlier review missed. It checks that the change does what the
+   description asks for, completely: missing cases, flows the feature needs but does
+   not handle, behaviour that contradicts the description. New findings become inline
+   comments. Nothing already said in an existing thread, by you or anyone else, is
+   repeated.
 4. **Summary:** one comment on the PR:
    > **Follow-up review** (`916a2e0` → `a1b2c3d`): 1 of 2 earlier findings fixed, 1 still
    > open, 0 partly fixed, 1 new finding.
+
+```
+main:   o───o───o───X───Y                    X, Y landed later: not the PR's changes
+             \
+PR:           a───b───A ───d───e───B          A = last reviewed, B = now
+              └──────────────────┘
+              whole PR reviewed vs the branch point, d + e looked at first
+```
 
 `prk` records each verdict on the saved comment, so `prk -c` and the details screen
 show ✅ / ⚠️ / ↔️ next to it. Replies use the same `.../pulls/<n>/comments` endpoint
