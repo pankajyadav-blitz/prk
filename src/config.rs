@@ -29,11 +29,12 @@ pub struct SlackCfg {
     pub channel: String,
     /// Slack member id whose tag triggers a review.
     pub reviewer: String,
-    /// xoxb- bot token with channels:history. With it, a start catches up on
-    /// requests posted while prk was not running. Empty = no catch-up.
+    /// Token that reads the channel history: the app's xoxb- bot token, or a
+    /// member's xoxp- user token. With it, a start catches up on today's
+    /// requests. Empty = no catch-up.
     pub bot_token: String,
-    /// How far back a start may catch up, in hours. 0 = no catch-up.
-    pub catch_up_hours: u64,
+    /// Catch up on today's requests when prk starts.
+    pub catch_up: bool,
 }
 
 impl Default for SlackCfg {
@@ -43,7 +44,7 @@ impl Default for SlackCfg {
             channel: String::new(),
             reviewer: String::new(),
             bot_token: String::new(),
-            catch_up_hours: 24,
+            catch_up: true,
         }
     }
 }
@@ -239,9 +240,14 @@ impl Config {
                 "{at}: slack.reviewer must be a Slack member id (U...), from profile -> ⋮ -> Copy member ID"
             ));
         }
-        if !self.slack.bot_token.is_empty() && !self.slack.bot_token.starts_with("xoxb-") {
+        let reader = &self.slack.bot_token;
+        if !reader.is_empty()
+            && !["xoxb-", "xoxp-", "xoxe.xoxp-"]
+                .iter()
+                .any(|p| reader.starts_with(p))
+        {
             return Err(format!(
-                "{at}: slack.bot_token must be the app's xoxb- bot token (or empty)"
+                "{at}: slack.bot_token must be the app's xoxb- bot token or an xoxp- user token (or empty)"
             ));
         }
         if self.github.orgs.is_empty() {
@@ -351,7 +357,7 @@ mod tests {
         assert!(!cfg.review.keep_repos);
         assert!(cfg.review.follow_up);
         assert!(!cfg.review.once_per_pr);
-        assert_eq!(cfg.slack.catch_up_hours, 24);
+        assert!(cfg.slack.catch_up);
         assert!(cfg.slack.bot_token.is_empty());
         let tools = cfg.allowed_tools("Blitzscale-19", "suchna", 823);
         assert!(tools.contains(&"Bash(gh pr diff 823:*)".to_string()));

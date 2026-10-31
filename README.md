@@ -14,7 +14,7 @@ each earlier comment, replies *fixed* / *still present* / *partly fixed* in its 
 and reviews only what changed.
 
 It also:
-- **catches up** on requests posted while it was not running
+- **catches up** on start: every request posted in the channel **today** is picked up
 - **keeps a queue** that survives restarts, and retries failed reviews
 - **skips** what was already reviewed, by `prk` or by you on GitHub
 - shows a **live dashboard**, a **history** (`prk -H`) and the **comments** each
@@ -98,8 +98,9 @@ To update later: `git pull && cargo install --path .`
 5. **Install App** → **Install to Workspace** → Allow. Reinstall whenever Slack asks
    after a scope change.
 6. **OAuth & Permissions** → copy the **Bot User OAuth Token** (`xoxb-...`). This is
-   `slack.bot_token`. `prk` uses it to catch up on requests posted while it was off.
-   You can leave it out, but then only requests posted while `prk` runs are seen.
+   `slack.bot_token`. On every start `prk` uses it to read **today's** messages and
+   pick up the review requests in them. A user token (`xoxp-...`) of someone in the
+   channel works too. Leave it empty and only requests posted while `prk` runs are seen.
 7. In Slack, open the channel (`#peer-review`) and run:
    ```
    /invite @prk-<yourname>
@@ -230,7 +231,7 @@ Every line should have a ✓:
 ```
 config /home/you/.config/prk/config.toml
 ✓ slack     app token works; watching CPWCB54G2 for <@U0XXXXXXX>
-✓ catch-up  bot token reads the channel; catches up 24h back
+✓ catch-up  reads the channel; 12 message(s) today, caught up on each start
 ✓ github    comments will be posted as your-github-login
 ✓ git ssh   ssh to github.com works
 ✓ claude    2.x (Claude Code) via oauth_token (subscription)
@@ -488,9 +489,9 @@ full review instead. Set `review.follow_up = false` to always do full reviews, o
 
 | Case | What `prk` does |
 |---|---|
-| `prk` was off or started late | On start it reads the channel since the last message it saw, at most `catch_up_hours` back, and queues every request that tags you (needs `slack.bot_token`) |
-| First run ever | Catches up over the last `catch_up_hours` (default 24) |
-| Off for days | Never reads further back than `catch_up_hours`; set 72 to cover a weekend |
+| `prk` was off or started late | On start it reads **today's** messages (from 00:00, machine time) and queues every request that tags you (needs `slack.bot_token`) |
+| Requests from before today | Not picked up on start. Ask again, or run `prk review <url>`. |
+| Restarted several times today | Each start rescans the whole day; a message already turned into a job is recognised and not queued again |
 | Same message seen live and by catch-up | Queued once (each Slack message becomes at most one job per PR) |
 | Same PR tagged in several messages | Queued once while it is waiting or running |
 | Commit already reviewed by `prk` | Skipped: `already reviewed at <commit>` |
@@ -552,8 +553,8 @@ being ignored.
 | `app_token` | ✅ | | Slack app-level token, `xapp-...`, scope `connections:write` |
 | `channel` | ✅ | | Channel id to watch, e.g. `CPWCB54G2` for `#peer-review` |
 | `reviewer` | ✅ | | Your Slack member id (`U0...`). Tags of this id start a review. |
-| `bot_token` | | | The app's `xoxb-` token (`channels:history`), for catch-up |
-| `catch_up_hours` | | `24` | How far back a start may catch up. `0` = no catch-up. |
+| `bot_token` | | | Reads the channel for catch-up: the app's `xoxb-` token (`channels:history`), or an `xoxp-` user token |
+| `catch_up` | | `true` | On every start, pick up today's review requests (from 00:00, machine time) |
 | **`[github]`** | | | |
 | `token` | | gh login | Fine-grained token; comments are posted as this account |
 | `ssh_key` | | ssh setup | Private key for `git clone`/`fetch` |
@@ -587,7 +588,7 @@ The full annotated example is `config.example.toml`.
 |---|---|
 | `~/.cargo/bin/prk` | The binary (`cargo install --path .`) |
 | `~/.config/prk/config.toml` | Your config (`chmod 600`). Override with `PRK_CONFIG` or `--config`. |
-| `~/.local/share/prk/state.sqlite3` | The queue, the history, saved comments and how far Slack was read |
+| `~/.local/share/prk/state.sqlite3` | The queue, the history and the saved comments |
 | `~/.local/share/prk/logs/<org>-<repo>-<n>-<commit>-<time>.log` | Claude's output for each review |
 | `~/.local/share/prk/repos/<org>/<repo>-pr<n>` | The clone while a review runs; deleted afterwards |
 | `~/.config/systemd/user/prk.service` | The service, if installed |

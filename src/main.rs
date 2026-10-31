@@ -383,7 +383,7 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
     let orgs = cfg.github.orgs.clone();
     let app_token = cfg.slack.app_token.clone();
     let bot_token = cfg.slack.bot_token.clone();
-    let catch_up_hours = cfg.slack.catch_up_hours;
+    let catch_up = cfg.slack.catch_up;
     let timeout_minutes = cfg.review.timeout_minutes;
     if tty {
         activity::get().set_tui(true);
@@ -403,19 +403,11 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
     let stop = Arc::new(Stop::default());
     install_signal_handlers(stop.clone());
 
-    // Where catch-up starts, taken before the listener moves the cursor on.
-    let oldest = catchup::oldest(db.cursor(&channel), catch_up_hours, db::now() as f64);
-
     let queue = {
         let db = db.clone();
         let channel = channel.clone();
         let reviewer_id = reviewer_id.clone();
         move |event: &serde_json::Value, source: &str| -> bool {
-            if let Some(ts) = event.get("ts").and_then(|t| t.as_str())
-                && event.get("channel").and_then(|c| c.as_str()) == Some(channel.as_str())
-            {
-                db.set_cursor(&channel, ts);
-            }
             let Some(request) = slack::request(event, &channel, &reviewer_id, &orgs) else {
                 return false;
             };
@@ -462,21 +454,21 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
         })
     };
 
-    if bot_token.is_empty() || catch_up_hours == 0 {
+    if bot_token.is_empty() || !catch_up {
         if bot_token.is_empty() {
             info!("no slack.bot_token, so no catch-up on requests posted while prk was off");
         }
     } else {
         let queue = queue.clone();
         let channel = channel.clone();
+        let oldest = catchup::today_start();
         std::thread::spawn(
             move || match catchup::messages(&bot_token, &channel, oldest) {
                 Ok(messages) => {
                     let n = messages.iter().filter(|m| queue(m, "catch-up")).count();
                     info!(
-                        "caught up on {} message(s) since {}: {n} new request(s)",
-                        messages.len(),
-                        view::when(oldest as i64)
+                        "caught up on today's {} message(s): {n} new request(s)",
+                        messages.len()
                     );
                     activity::get().set_caught_up(Ok(n));
                 }
@@ -592,18 +584,18 @@ fn check(cfg: &Config) -> i32 {
         "catch-up",
         if cfg.slack.bot_token.is_empty() {
             Ok("off (no slack.bot_token): requests posted while prk is off are missed".into())
-        } else if cfg.slack.catch_up_hours == 0 {
-            Ok("off (catch_up_hours = 0)".into())
+        } else if !cfg.slack.catch_up {
+            Ok("off (slack.catch_up = false)".into())
         } else {
             catchup::messages(
                 &cfg.slack.bot_token,
                 &cfg.slack.channel,
-                db::now() as f64 - 3600.0,
+                catchup::today_start(),
             )
-            .map(|_| {
+            .map(|today| {
                 format!(
-                    "bot token reads the channel; catches up {}h back",
-                    cfg.slack.catch_up_hours
+                    "reads the channel; {} message(s) today, caught up on each start",
+                    today.len()
                 )
             })
         },

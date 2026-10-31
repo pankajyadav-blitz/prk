@@ -15,13 +15,14 @@ channel = "CPWCB54G2"
 # YOUR Slack member id: profile -> ⋮ -> Copy member ID. A message in the channel
 # that tags this id and links a PR starts a review.
 reviewer = "U0XXXXXXXXX"
-# The app's Bot User OAuth Token (xoxb-..., scope channels:history). With it, every
-# start catches up on review requests posted while prk was not running. Empty =
-# no catch-up: only requests posted while prk runs are seen.
+# Token that reads the channel history, for catch-up: the app's Bot User OAuth Token
+# (xoxb-..., scope channels:history), or your own user token (xoxp-...) if you are a
+# member of the channel. Empty = no catch-up: only requests posted while prk runs.
 bot_token = ""
-# How far back a start may catch up, in hours (it starts after the last message
-# prk saw, but never earlier than this). 0 = no catch-up. 72 covers a weekend.
-catch_up_hours = 24
+# On every start, read today's messages (from 00:00 on this machine's clock) and queue
+# the review requests in them. A request already queued, or a PR already reviewed at
+# its current commit, is not reviewed again, so restarting is always safe.
+catch_up = true
 
 [github]
 # Fine-grained token from YOUR GitHub account: Blitzscale-19 repos,

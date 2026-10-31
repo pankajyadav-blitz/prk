@@ -1,6 +1,5 @@
 //! The local database (workdir/state.sqlite3): the review queue, which doubles
-//! as the history `prk -H` lists, the comments each review posted (`prk -c`),
-//! and how far the Slack channel has been read (for catch-up after a restart).
+//! as the history `prk -H` lists, and the comments each review posted (`prk -c`).
 //!
 //! A job goes waiting -> running -> reviewed | skipped | failed. A failed job is
 //! put back to waiting (with a delay) until it has used its attempts, and a
@@ -576,29 +575,6 @@ impl Db {
         .unwrap_or_default()
     }
 
-    pub fn cursor(&self, channel: &str) -> Option<f64> {
-        self.conn()
-            .query_row(
-                "SELECT last_ts FROM cursors WHERE channel = ?1",
-                params![channel],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .and_then(|ts| ts.parse().ok())
-    }
-
-    /// Move the read position forward, never back.
-    pub fn set_cursor(&self, channel: &str, ts: &str) {
-        self.exec(
-            "INSERT INTO cursors (channel, last_ts) VALUES (?1, ?2) \
-             ON CONFLICT(channel) DO UPDATE SET last_ts = ?2 \
-             WHERE CAST(last_ts AS REAL) < CAST(?2 AS REAL)",
-            params![channel, ts],
-        );
-    }
-
     fn select(&self, sql: &str, args: impl rusqlite::Params) -> Vec<Job> {
         let conn = self.conn();
         let Ok(mut stmt) = conn.prepare(sql) else {
@@ -751,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn verdicts_land_on_the_saved_comment_and_cursors_only_move_forward() {
+    fn verdicts_land_on_the_saved_comment() {
         let db = temp("verdict");
         let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "slack", false).unwrap() else {
             panic!()
@@ -768,9 +744,5 @@ mod tests {
         db.set_verdict(77, "fixed", "abc");
         assert_eq!(db.comments(id)[0].verdict, "fixed");
         assert_eq!(db.verdicts("o", "r", 1), vec![(77, "fixed".to_string())]);
-
-        db.set_cursor("C1", "100.5");
-        db.set_cursor("C1", "99.0");
-        assert_eq!(db.cursor("C1"), Some(100.5));
     }
 }

@@ -95,14 +95,19 @@ pub fn ts_of(message: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Where catch-up starts: just after the last message seen, but never further
-/// back than `hours`.
-pub fn oldest(cursor: Option<f64>, hours: u64, now: f64) -> f64 {
-    let floor = now - (hours as f64) * 3600.0;
-    match cursor {
-        Some(seen) => seen.max(floor),
-        None => floor,
-    }
+/// Where catch-up starts: today 00:00 on this machine's clock. Every start
+/// rescans the whole day; requests already queued are recognised and skipped.
+pub fn today_start() -> f64 {
+    use chrono::{Local, TimeZone};
+    let midnight = Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_default();
+    Local
+        .from_local_datetime(&midnight)
+        .earliest()
+        .map(|t| t.timestamp() as f64)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -110,10 +115,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn starts_after_the_cursor_but_never_before_the_window() {
-        let now = 1_000_000.0;
-        assert_eq!(oldest(None, 24, now), now - 86_400.0);
-        assert_eq!(oldest(Some(now - 60.0), 24, now), now - 60.0);
-        assert_eq!(oldest(Some(now - 200_000.0), 24, now), now - 86_400.0);
+    fn today_starts_at_local_midnight() {
+        let start = today_start();
+        let now = chrono::Local::now().timestamp() as f64;
+        assert!(start <= now && now - start < 86_400.0 + 3600.0);
+        let t = chrono::DateTime::from_timestamp(start as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(t.format("%H:%M:%S").to_string(), "00:00:00");
     }
 }
