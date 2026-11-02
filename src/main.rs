@@ -27,6 +27,7 @@ mod slack;
 mod socket;
 mod stop;
 mod tui;
+mod update;
 mod view;
 
 use std::io::{IsTerminal, Write};
@@ -58,7 +59,8 @@ use crate::view::{bold, dim, paint};
         prk --stats          totals: reviewed, skipped, failed, follow-up verdicts\n  \
         prk review <PR url>  review one PR now (--force to review an already reviewed commit)\n  \
         prk check            check Slack, GitHub, ssh and Claude\n  \
-        prk setup-token      create a Claude subscription token and save it in the config"
+        prk setup-token      create a Claude subscription token and save it in the config\n  \
+        prk update           update prk to the latest release"
 )]
 struct Cli {
     /// config.toml to read (default: $PRK_CONFIG, then ~/.config/prk/config.toml)
@@ -131,6 +133,8 @@ enum Cmd {
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
     },
+    /// Update prk to the latest GitHub release
+    Update,
 }
 
 fn die(message: impl AsRef<str>) -> ! {
@@ -146,6 +150,12 @@ fn main() {
     if let Some(Cmd::SetupToken { token }) = &cli.command {
         if let Err(e) = setup::run(&path, "claude", token.clone()) {
             die(e);
+        }
+        return;
+    }
+    if let Some(Cmd::Update) = &cli.command {
+        if let Err(e) = update::self_update() {
+            die(format!("update failed: {e}"));
         }
         return;
     }
@@ -168,7 +178,9 @@ fn main() {
     match cli.command {
         Some(Cmd::Check) => std::process::exit(check(&cfg)),
         Some(Cmd::Review { url, force }) => review_now(cfg, db, &url, force, cli.dry_run),
-        Some(Cmd::SetupToken { .. }) => unreachable!("handled before the config is loaded"),
+        Some(Cmd::SetupToken { .. }) | Some(Cmd::Update) => {
+            unreachable!("handled before the config is loaded")
+        }
         None => listen(cfg, db, cli.dry_run),
     }
 }

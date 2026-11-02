@@ -1,6 +1,6 @@
 # systemd user service. Install:
 #   mkdir -p ~/.config/systemd/user
-#   cp prk.service ~/.config/systemd/user/
+#   curl -fsSL -o ~/.config/systemd/user/prk.service https://github.com/pankajyadav-blitz/prk/releases/latest/download/prk.service
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now prk
 #   loginctl enable-linger "$USER"     # keep it running after you log out (servers)
@@ -12,11 +12,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.cargo/bin/prk
+# Built from source with cargo? Use %h/.cargo/bin/prk instead.
+ExecStart=%h/.local/bin/prk
 Restart=always
 RestartSec=10
 # gh, git and claude must be on this PATH.
-Environment=PATH=%h/.cargo/bin:%h/.local/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

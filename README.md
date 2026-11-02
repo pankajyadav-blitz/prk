@@ -50,31 +50,42 @@ machine or on a server.
 
 ## 1. Install
 
-You need these on the machine that runs `prk`:
+You need these on the machine that runs `prk` (Linux, macOS, or Windows via WSL):
 
 | Tool | Check | Install |
 |---|---|---|
-| Rust (cargo) | `cargo --version` | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| git | `git --version` | your package manager |
+| curl, git | `git --version` | your package manager |
 | GitHub CLI | `gh --version` | https://cli.github.com (installed is enough: **no `gh auth login` needed**, `prk` gives it the token from `github.token`) |
 | Claude Code | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
 
-Then build and install `prk`:
+Install the prebuilt `prk` binary (no Rust needed):
 
 ```bash
-git clone <this repo> ~/prk
-cd ~/prk
-cargo install --path .
+curl -fsSL https://github.com/pankajyadav-blitz/prk/releases/latest/download/install.sh | sh
 ```
 
-This puts the binary at `~/.cargo/bin/prk`. With `~/.cargo/bin` on your `PATH` (rustup
-adds it), you can run `prk` from any directory, the same way as `sts`:
+This puts the binary at `~/.local/bin/prk`. If that folder is not on your `PATH`, the
+installer prints the line to add to `~/.zshrc` / `~/.bashrc`. Then:
 
 ```bash
+prk --version
 prk --help
 ```
 
-To update later: `git pull && cargo install --path .`
+- **Update** later with `prk update` (downloads the latest release, checks its sha256, replaces the binary).
+- Other folder: `curl -fsSL .../install.sh | PRK_INSTALL_DIR=/usr/local/bin sh`. A fixed version: `PRK_VERSION=v0.1.1`.
+- Direct downloads (one archive per platform, with a `.sha256`): https://github.com/pankajyadav-blitz/prk/releases/latest
+
+**From source instead** (needs Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`):
+
+```bash
+git clone https://github.com/pankajyadav-blitz/prk.git ~/prk
+cd ~/prk && cargo install --path .     # installs to ~/.cargo/bin/prk
+```
+
+**Releasing** (maintainers): bump `version` in `Cargo.toml`, commit, then
+`git tag vX.Y.Z && git push origin main vX.Y.Z`. GitHub Actions builds Linux (x86_64,
+arm64, static musl) and macOS (Intel, Apple Silicon) binaries and publishes the release.
 
 ---
 
@@ -182,7 +193,8 @@ for suchna):
 
 ```bash
 mkdir -p ~/.config/prk
-cp ~/prk/config.example.toml ~/.config/prk/config.toml
+curl -fsSL -o ~/.config/prk/config.toml \
+  https://github.com/pankajyadav-blitz/prk/releases/latest/download/config.example.toml
 chmod 600 ~/.config/prk/config.toml
 nano ~/.config/prk/config.toml
 ```
@@ -266,7 +278,8 @@ server), use the systemd user service in this repo:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp ~/prk/prk.service ~/.config/systemd/user/
+curl -fsSL -o ~/.config/systemd/user/prk.service \
+  https://github.com/pankajyadav-blitz/prk/releases/latest/download/prk.service
 systemctl --user daemon-reload
 systemctl --user enable --now prk
 loginctl enable-linger "$USER"     # servers: keep running after you log out
@@ -281,9 +294,11 @@ systemctl --user restart prk       # after editing the config
 While the service runs, `prk -H`, `prk -c` and `prk --stats` still work from any
 terminal: they read the same local database.
 
-`prk.service` sets a `PATH` with `~/.cargo/bin`, `~/.local/bin` and `~/.bun/bin`.
-If `gh`, `git` or `claude` is installed somewhere else, add that folder to the
-`Environment=PATH=` line.
+`prk.service` runs `~/.local/bin/prk` (where the installer puts it). If you built from
+source, change `ExecStart=` to `%h/.cargo/bin/prk`. It sets a `PATH` with `~/.local/bin`,
+`~/.cargo/bin` and `~/.bun/bin`; if `gh`, `git` or `claude` is installed somewhere else,
+add that folder to the `Environment=PATH=` line. After `prk update`, run
+`systemctl --user restart prk`.
 
 ---
 
@@ -303,6 +318,7 @@ If `gh`, `git` or `claude` is installed somewhere else, add that folder to the
 | `prk review <PR url> -f` | A full review even if this commit was already reviewed (no follow-up) |
 | `prk check` | Check the config and that Slack, catch-up, GitHub, ssh and Claude work |
 | `prk setup-token` | Create a Claude subscription token and save it in the config |
+| `prk update` | Update `prk` to the latest release |
 | `-d`, `--dry-run` | Look PRs up and say what would happen; review and post nothing |
 | `-v`, `--verbose` | Debug logging, including every git/gh command |
 | `--config <path>` | Use a different config file |
@@ -586,7 +602,7 @@ The full annotated example is `config.example.toml`.
 
 | Path | What |
 |---|---|
-| `~/.cargo/bin/prk` | The binary (`cargo install --path .`) |
+| `~/.local/bin/prk` | The binary (install script; `~/.cargo/bin/prk` if built from source) |
 | `~/.config/prk/config.toml` | Your config (`chmod 600`). Override with `PRK_CONFIG` or `--config`. |
 | `~/.local/share/prk/state.sqlite3` | The queue, the history and the saved comments |
 | `~/.local/share/prk/logs/<org>-<repo>-<n>-<commit>-<time>.log` | Claude's output for each review |
@@ -612,4 +628,4 @@ is about 16 MB and takes around 10 seconds.
 | `✗ git ssh` | `ssh -T git@github.com` must greet you; set `github.ssh_key` |
 | A review failed | `prk -H <PR url>` shows the reason and the log path. A refused `gh` command in the log means a tool was missing; add it to `review.allowed_tools`. |
 | `Claude usage limit` | The plan's limit is used up; the queue resumes by itself after 30 minutes |
-| `prk: command not found` | Add `~/.cargo/bin` to `PATH`, or run `cargo install --path .` again |
+| `prk: command not found` | Add `~/.local/bin` (or `~/.cargo/bin` if built from source) to `PATH`, or rerun the install script |
