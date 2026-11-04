@@ -120,7 +120,9 @@ jobs:
           # init needs a terminal; without one it must say so, not hang
           $out = '' | & $prk init 2>&1 | Out-String
           if ($out -notmatch 'run it in a terminal') { throw "init: $out" }
-          Test-Path "$HOME\.local\share\prk\state.sqlite3"
+          if (-not (Test-Path "$HOME\.local\share\prk\state.sqlite3")) { throw "no state database" }
+          # the init above failed on purpose; don't let its exit code fail the step
+          exit 0
 
       - name: Run prk in cmd
         shell: cmd
