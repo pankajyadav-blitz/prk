@@ -51,8 +51,11 @@ jobs:
         shell: pwsh
         run: |
           Start-Process python -ArgumentList '-m','http.server','8765','--bind','127.0.0.1','--directory','dist' -WindowStyle Hidden
-          Start-Sleep 3
-          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/VERSION).Content
+          # wait (up to 60s) until it answers
+          for ($i = 0; $i -lt 60; $i++) {
+            try { (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/VERSION).Content; exit 0 } catch { Start-Sleep 1 }
+          }
+          throw "the local release server did not start"
 
       - name: Install with install.ps1 (PowerShell 7)
         shell: pwsh
