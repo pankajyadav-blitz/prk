@@ -104,16 +104,47 @@ pub struct Comment {
 
 /// Whether `pid` is a live prk process; a pid the system handed to something
 /// else since does not count.
+#[cfg(target_os = "linux")]
 fn is_prk(pid: i64) -> bool {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|cmd| {
             let argv0 = cmd.split(|b| *b == 0).next().unwrap_or_default();
-            let argv0 = String::from_utf8_lossy(argv0);
-            Path::new(argv0.as_ref())
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("prk"))
+            named_prk(&String::from_utf8_lossy(argv0))
         })
         .unwrap_or(false)
+}
+
+/// Whether `pid` is a live prk process (no /proc here: ask tasklist).
+#[cfg(windows)]
+fn is_prk(pid: i64) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|out| {
+            // "prk.exe","1234",... -- or an INFO line when there is no such process
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.split(',').next())
+                .any(|image| named_prk(image.trim_matches('"')))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `pid` is a live prk process (no /proc here: ask ps).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_prk(pid: i64) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map(|out| out.status.success() && named_prk(String::from_utf8_lossy(&out.stdout).trim()))
+        .unwrap_or(false)
+}
+
+/// Whether a program path or name is prk (or its test binary, prk-<hash>).
+fn named_prk(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().to_lowercase().starts_with("prk"))
 }
 
 /// What `enqueue` did.

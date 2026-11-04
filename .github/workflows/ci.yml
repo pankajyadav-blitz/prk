@@ -111,7 +111,8 @@ jobs:
           Write-Host $out
           if ($code -ne 1) { throw "check should fail on the fake Slack token (exit $code)" }
           if ($out -notmatch 'slack .*invalid_auth') { throw "no slack line" }
-          if ($out -notmatch 'github .*posted as') { throw "github check did not run gh" }
+          # the CI token may not read /user (HTTP 403); either answer means gh ran
+          if ($out -notmatch 'github .*(posted as|HTTP 403)') { throw "github check did not run gh" }
           if ($out -notmatch 'claude .*Claude Code') { throw "claude.cmd was not found or did not run" }
           & $prk -H; if ($LASTEXITCODE -ne 0) { throw "history failed" }
           & $prk --stats; if ($LASTEXITCODE -ne 0) { throw "stats failed" }
