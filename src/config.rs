@@ -25,7 +25,7 @@ pub struct Config {
 pub struct SlackCfg {
     /// xapp- app-level token with connections:write (Socket Mode).
     pub app_token: String,
-    /// Channel id to watch, e.g. C0123ABCDEF.
+    /// Channel id to watch, e.g. C0123ABCDEF. Default: #peer-review.
     pub channel: String,
     /// Slack member id whose tag triggers a review.
     pub reviewer: String,
@@ -41,7 +41,7 @@ impl Default for SlackCfg {
     fn default() -> Self {
         SlackCfg {
             app_token: String::new(),
-            channel: String::new(),
+            channel: DEFAULT_CHANNEL.to_string(),
             reviewer: String::new(),
             bot_token: String::new(),
             catch_up: true,
@@ -177,6 +177,9 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "Bash(git branch:*)",
 ];
 
+/// #peer-review, where review requests are posted.
+pub const DEFAULT_CHANNEL: &str = "CPWCB54G2";
+
 const LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// `$PRK_CONFIG`, else ~/.config/prk/config.toml.
@@ -208,8 +211,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             format!(
-                "{}: cannot be read ({e}). Copy config.example.toml there and fill it in, \
-                 or pass --config PATH.",
+                "{}: cannot be read ({e}). Run `prk init` to create it, or pass --config PATH.",
                 path.display()
             )
         })?;
@@ -338,6 +340,7 @@ mod tests {
     use super::*;
 
     const MINIMAL: &str = "[slack]\napp_token = \"xapp-1\"\nchannel = \"C1\"\nreviewer = \"U1\"\n";
+    const NO_CHANNEL: &str = "[slack]\napp_token = \"xapp-1\"\nreviewer = \"U1\"\n";
 
     fn parse(text: &str) -> Result<Config, String> {
         let mut cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
@@ -348,6 +351,7 @@ mod tests {
 
     #[test]
     fn minimal_config_takes_the_defaults() {
+        assert_eq!(parse(NO_CHANNEL).unwrap().slack.channel, "CPWCB54G2");
         let cfg = parse(MINIMAL).unwrap();
         assert_eq!(cfg.review.level, "medium");
         assert_eq!(cfg.review.max_budget_usd, 2.0);

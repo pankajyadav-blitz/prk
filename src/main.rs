@@ -12,6 +12,7 @@
 //!     prk -H                   # history of reviews
 //!     prk -c <PR url>          # the comments a review posted
 //!     prk review <PR url>      # review one PR now
+//!     prk init                 # set prk up on this machine
 //!     prk check                # prove every credential works
 
 mod activity;
@@ -20,6 +21,7 @@ mod config;
 mod db;
 mod exec;
 mod github;
+mod init;
 mod log;
 mod review;
 mod setup;
@@ -58,6 +60,7 @@ use crate::view::{bold, dim, paint};
         prk -c <PR url>      comments the latest review of that PR posted\n  \
         prk --stats          totals: reviewed, skipped, failed, follow-up verdicts\n  \
         prk review <PR url>  review one PR now (--force to review an already reviewed commit)\n  \
+        prk init             set prk up on this machine (asks a few questions)\n  \
         prk check            check Slack, GitHub, ssh and Claude\n  \
         prk setup-token      create a Claude subscription token and save it in the config\n  \
         prk update           update prk to the latest release"
@@ -117,6 +120,8 @@ struct FilterArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Set prk up on this machine: Slack app, GitHub, Claude, config file
+    Init,
     /// Check the config and that Slack, GitHub, git and Claude all work
     Check,
     /// Review one PR now, without Slack
@@ -153,6 +158,12 @@ fn main() {
         }
         return;
     }
+    if let Some(Cmd::Init) = &cli.command {
+        if let Err(e) = init::run(&path) {
+            die(e);
+        }
+        return;
+    }
     if let Some(Cmd::Update) = &cli.command {
         if let Err(e) = update::self_update() {
             die(format!("update failed: {e}"));
@@ -178,7 +189,7 @@ fn main() {
     match cli.command {
         Some(Cmd::Check) => std::process::exit(check(&cfg)),
         Some(Cmd::Review { url, force }) => review_now(cfg, db, &url, force, cli.dry_run),
-        Some(Cmd::SetupToken { .. }) | Some(Cmd::Update) => {
+        Some(Cmd::SetupToken { .. }) | Some(Cmd::Update) | Some(Cmd::Init) => {
             unreachable!("handled before the config is loaded")
         }
         None => listen(cfg, db, cli.dry_run),

@@ -1,4 +1,5 @@
-# prk config. Copy to ~/.config/prk/config.toml, fill in your
+# Every prk option. `prk init` writes a short config with only your tokens; copy what
+# you need from here. To use this whole file instead: copy it to ~/.config/prk/config.toml, fill in your
 # own values, then: chmod 600 ~/.config/prk/config.toml
 # The bot refuses to run while other users can read this file (it holds tokens).
 
@@ -10,8 +11,8 @@ workdir = "~/.local/share/prk"
 # App-level token (xapp-...) with connections:write, for Socket Mode. The app must be
 # in the channel (/invite @app) and subscribed to the message.channels bot event.
 app_token = "xapp-..."
-# Channel id to watch (#peer-review).
-channel = "CPWCB54G2"
+# Channel id to watch. Default: CPWCB54G2 (#peer-review).
+channel = "CPWCB54G2"   # the default
 # YOUR Slack member id: profile -> ⋮ -> Copy member ID. A message in the channel
 # that tags this id and links a PR starts a review.
 reviewer = "U0XXXXXXXXX"

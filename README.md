@@ -29,12 +29,9 @@ machine or on a server.
 ## Contents
 
 1. [Install](#1-install)
-2. [Create the Slack app](#2-create-the-slack-app)
-3. [Create the GitHub token](#3-create-the-github-token)
-4. [Get a Claude token](#4-get-a-claude-token)
-5. [Create the config file](#5-create-the-config-file)
-6. [Check and run](#6-check-and-run)
-7. [Run it as a service](#7-run-it-as-a-service)
+2. [Set up: `prk init`](#2-set-up-prk-init)
+3. [Check and run](#3-check-and-run)
+4. [Run it as a service](#4-run-it-as-a-service)
 - [Commands](#commands)
 - [The dashboard](#the-dashboard)
 - [History and comments](#history-and-comments)
@@ -55,7 +52,7 @@ You need these on the machine that runs `prk` (Linux, macOS, or Windows via WSL)
 | Tool | Check | Install |
 |---|---|---|
 | curl, git | `git --version` | your package manager |
-| GitHub CLI | `gh --version` | https://cli.github.com (installed is enough: **no `gh auth login` needed**, `prk` gives it the token from `github.token`) |
+| GitHub CLI | `gh --version` | https://cli.github.com (`gh auth login` is optional: `prk init` can use it, or a token instead) |
 | Claude Code | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
 
 Install the prebuilt `prk` binary (no Rust needed):
@@ -69,7 +66,7 @@ installer prints the line to add to `~/.zshrc` / `~/.bashrc`. Then:
 
 ```bash
 prk --version
-prk --help
+prk init          # next step
 ```
 
 - **Update** later with `prk update` (downloads the latest release, checks its sha256, replaces the binary).
@@ -89,150 +86,78 @@ arm64, static musl) and macOS (Intel, Apple Silicon) binaries and publishes the 
 
 ---
 
-## 2. Create the Slack app
+## 2. Set up: `prk init`
 
-`prk` listens to Slack through **Socket Mode**, which needs a Slack app.
+```bash
+prk init
+```
+
+It asks a few questions, checks each answer as you give it, and writes
+`~/.config/prk/config.toml` (mode 600). Run it again any time: whatever already works
+is kept, and it asks only for what is missing or broken. Stopping half-way keeps what
+you entered so far.
+
+What it walks you through:
+
+1. **Tools.** Checks that `git`, `gh` and `claude` are installed.
+2. **Slack.** Prints a link that opens Slack's *Create app* page with everything
+   filled in (Socket Mode, the bot scopes, the `message.channels` event). Click
+   **Create**, then:
+   - **Basic Information → App-Level Tokens → Generate Token and Scopes**, scope
+     `connections:write`. Paste the `xapp-...` token.
+   - **Install App → Install to Workspace**. Paste the **Bot User OAuth Token** (`xoxb-...`).
+
+   `prk` then joins `#peer-review` itself and finds **your member id** from your
+   Slack email (it offers your `git config user.email`). Confirm the name it shows.
+3. **GitHub.** If `gh` is logged in, it offers to post comments as that account. Or
+   it opens a prefilled page to create a fine-grained token (owner `Blitzscale-19`,
+   Pull requests: Read and write, Contents: Read-only) and you paste it. Either way it
+   shows the account comments will be posted as. Then it checks that git can reach
+   GitHub over ssh, and tells you how to add a key if not.
+4. **Claude.** Runs `claude setup-token` (browser login with your Claude
+   subscription) and saves the long-lived token. Skip it to use this machine's
+   `claude` login instead, which expires sooner.
+5. **Check.** Runs [`prk check`](#3-check-and-run).
+
+The config it writes holds only these values; everything else takes its default:
+
+```toml
+[slack]
+app_token = "xapp-..."
+bot_token = "xoxb-..."
+reviewer  = "U0..."
+
+[github]
+token = ""          # empty = your gh login; or github_pat_...
+
+[claude]
+oauth_token = "sk-ant-oat01-..."
+```
+
+Add [review rules](#review-rules) or change any [other setting](#config-reference) by
+editing the file; [config.example.toml](config.example.toml) lists every option. The
+config lives at `~/.config/prk/config.toml`; set `PRK_CONFIG=/path` or pass
+`--config /path` to use another (works with `prk init` too).
 
 > **One running `prk` per Slack app.** Slack spreads events across every connection
 > that uses the same app token, so two processes on one app each see only some of the
 > messages. Give each person's `prk` its own app, and don't share one with another bot.
 
-1. Go to https://api.slack.com/apps → **Create New App** → **From scratch**. Name it,
-   for example `prk-<yourname>`, and pick the workspace.
-2. **Socket Mode** (left menu) → turn **Enable Socket Mode** on. When asked for an
-   app-level token, name it `prk` and keep the `connections:write` scope. Copy the
-   token: it starts with `xapp-`. This is `slack.app_token`.
-3. **OAuth & Permissions** → **Bot Token Scopes** → add `channels:history`
-   (and `groups:history` if the channel is private).
-4. **Event Subscriptions** → turn **Enable Events** on → **Subscribe to bot events** →
-   add `message.channels` (and `message.groups` for a private channel) → **Save Changes**.
-5. **Install App** → **Install to Workspace** → Allow. Reinstall whenever Slack asks
-   after a scope change.
-6. **OAuth & Permissions** → copy the **Bot User OAuth Token** (`xoxb-...`). This is
-   `slack.bot_token`. On every start `prk` uses it to read **today's** messages and
-   pick up the review requests in them. A user token (`xoxp-...`) of someone in the
-   channel works too. Leave it empty and only requests posted while `prk` runs are seen.
-7. In Slack, open the channel (`#peer-review`) and run:
-   ```
-   /invite @prk-<yourname>
-   ```
-8. Get the channel id: open the channel → click its name at the top → the id
-   (`C0...`) is at the bottom of the About tab. For `#peer-review` it is `CPWCB54G2`.
-   This is `slack.channel`.
-9. Get **your own** member id: click your profile picture → **Profile** → **⋮** →
-   **Copy member ID** (`U0...`). This is `slack.reviewer`. Messages that tag this id
-   start a review.
+**Other Claude options.** `prk setup-token` replaces the subscription token later
+(`--token sk-ant-oat01-...` saves one without the browser). An API key from
+https://console.anthropic.com goes in `claude.api_key` instead and is billed per
+token. With a subscription, reviews share your plan's limits with your own Claude Code
+use; when the limit is reached, `prk` pauses the queue for 30 minutes and retries.
+
+**Private channel.** Set `slack.channel` to its id, add the `groups:history` scope
+and the `message.groups` event to the app, reinstall it, and `/invite` the app.
+
+**Org approval.** If the org must approve fine-grained tokens, a new token works once
+an org admin approves it.
 
 ---
 
-## 3. Create the GitHub token
-
-Review comments are posted with this token, so they appear as **your** account.
-
-1. https://github.com/settings/personal-access-tokens → **Generate new token**
-   (fine-grained).
-2. **Resource owner**: `Blitzscale-19`. **Repository access**: All repositories, or
-   the ones you review.
-3. **Permissions → Repository permissions**:
-   - **Pull requests: Read and write** (read the PR, post review comments)
-   - **Contents: Read-only** (so the token can never merge or push)
-   - Metadata: Read-only (added automatically)
-4. Generate and copy it (`github_pat_...`). This is `github.token`.
-
-If the org requires approval for fine-grained tokens, the token works once an org
-admin approves it.
-
-**SSH key** for cloning: any key already added to your GitHub account
-(https://github.com/settings/keys) works. Put its path in `github.ssh_key`, for
-example `~/.ssh/id_ed25519`. Leave it empty to use your normal ssh setup. Check it
-with `ssh -T git@github.com`.
-
----
-
-## 4. Get a Claude token
-
-With the Claude Code CLI installed, the easiest way is to let `prk` do it, **after**
-you have created the config file (step 5):
-
-```bash
-prk setup-token
-```
-
-This runs `claude setup-token`, which opens a browser to log in with your Claude
-subscription and prints a long-lived token (`sk-ant-oat01-...`). Paste it when `prk`
-asks (the input is hidden). `prk` writes it into `[claude] oauth_token` in your config,
-keeps every other line and comment as it was, clears `api_key`, and sets the file to
-mode 600.
-
-Already have a token? Save it without the browser step:
-
-```bash
-prk setup-token --token sk-ant-oat01-...
-```
-
-Other options:
-
-| Option | How | Cost |
-|---|---|---|
-| **Subscription token** (recommended) | `prk setup-token` (above), or `claude setup-token` and paste it into `claude.oauth_token` yourself | Uses your Claude Pro/Max/Team plan's usage limits. No per-review charge. |
-| API key | https://console.anthropic.com → API Keys (`sk-ant-api03-...`) into `claude.api_key` | Billed per token used |
-| Nothing | Leave both empty | Uses whoever is logged in with `claude` on this machine |
-
-With a subscription, reviews share your plan's limits with your own Claude Code use.
-When the limit is reached, `prk` pauses the queue for 30 minutes and then retries.
-
----
-
-## 5. Create the config file
-
-The config lives at `~/.config/prk/config.toml`. To keep it somewhere else, set
-`PRK_CONFIG=/path/to/config.toml` or pass `--config /path/to/config.toml`.
-
-**Option A: copy the full example** (all settings, comments, and a starting rule set
-for suchna):
-
-```bash
-mkdir -p ~/.config/prk
-curl -fsSL -o ~/.config/prk/config.toml \
-  https://github.com/pankajyadav-blitz/prk/releases/latest/download/config.example.toml
-chmod 600 ~/.config/prk/config.toml
-nano ~/.config/prk/config.toml
-```
-
-**Option B: create a minimal one** with only the main fields. Replace every value in
-`<...>`:
-
-```bash
-mkdir -p ~/.config/prk
-cat > ~/.config/prk/config.toml <<'EOF'
-[slack]
-app_token = "<xapp-... from step 2>"
-bot_token = "<xoxb-... from step 2, for catch-up>"
-channel   = "CPWCB54G2"
-reviewer  = "<your Slack member id, U0...>"
-
-[github]
-token   = "<github_pat_... from step 3>"
-ssh_key = "~/.ssh/id_ed25519"
-
-[claude]
-oauth_token = ""
-
-[rules]
-all = """
-- Flag any secret, token, password or private key committed in code or config.
-"""
-EOF
-chmod 600 ~/.config/prk/config.toml
-prk setup-token          # fills in claude.oauth_token (step 4)
-```
-
-`chmod 600` is required: the file holds tokens, and `prk` refuses to start while other
-users can read it.
-
----
-
-## 6. Check and run
+## 3. Check and run
 
 ```bash
 prk check
@@ -271,7 +196,7 @@ output redirected, it prints plain log lines instead.
 
 ---
 
-## 7. Run it as a service
+## 4. Run it as a service
 
 To keep `prk` running in the background and start it on login (or on boot for a
 server), use the systemd user service in this repo:
@@ -316,6 +241,7 @@ add that folder to the `Environment=PATH=` line. After `prk update`, run
 | `prk --stats` | Totals: reviewed today / 7 days, skipped, failed, average time, comments, verdicts, by repo |
 | `prk review <PR url>` | Review one PR now, showing each step as it runs, then its comments |
 | `prk review <PR url> -f` | A full review even if this commit was already reviewed (no follow-up) |
+| `prk init` | Set prk up on this machine: Slack app, GitHub, Claude, config file. Re-run any time |
 | `prk check` | Check the config and that Slack, catch-up, GitHub, ssh and Claude work |
 | `prk setup-token` | Create a Claude subscription token and save it in the config |
 | `prk update` | Update `prk` to the latest release |
@@ -567,7 +493,7 @@ being ignored.
 | `workdir` | | `~/.local/share/prk` | Clones, logs and the database (queue, history, comments) |
 | **`[slack]`** | | | |
 | `app_token` | ✅ | | Slack app-level token, `xapp-...`, scope `connections:write` |
-| `channel` | ✅ | | Channel id to watch, e.g. `CPWCB54G2` for `#peer-review` |
+| `channel` | | `CPWCB54G2` (`#peer-review`) | Channel id to watch |
 | `reviewer` | ✅ | | Your Slack member id (`U0...`). Tags of this id start a review. |
 | `bot_token` | | | Reads the channel for catch-up: the app's `xoxb-` token (`channels:history`), or an `xoxp-` user token |
 | `catch_up` | | `true` | On every start, pick up today's review requests (from 00:00, machine time) |
@@ -621,7 +547,7 @@ is about 16 MB and takes around 10 seconds.
 | `holds tokens but other users can read it` | `chmod 600 ~/.config/prk/config.toml` |
 | `unknown field ...` | A typo, or a top-level key placed after a `[table]` |
 | `✗ slack ... invalid_auth` | `slack.app_token` must be the `xapp-` app-level token, not the `xoxb-` bot token |
-| `✗ catch-up ... not_in_channel` | `/invite @<your app>` in the channel |
+| `✗ catch-up ... not_in_channel` | Run `prk init` again (it joins the channel), or `/invite @<your app>` in the channel |
 | `✗ catch-up ... missing_scope` | Add the `channels:history` bot scope and reinstall the app |
 | Tagged, but nothing happens | Run `prk -d -v`. Check the app is invited to the channel, `message.channels` is subscribed, and `slack.reviewer` is your member id. Make sure no other process uses the same app token. |
 | `✗ github` | Token expired, or not approved by the org yet. `prk check` names the account. |

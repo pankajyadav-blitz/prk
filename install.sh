@@ -52,4 +52,4 @@ case ":$PATH:" in
   *":${install_dir}:"*) ;;
   *) echo "prk: add ${install_dir} to your PATH, e.g. echo 'export PATH=\"${install_dir}:\$PATH\"' >> ~/.zshrc" ;;
 esac
-echo "prk: next, create ~/.config/prk/config.toml (see the README) and run 'prk check'; update later with 'prk update'"
+echo "prk: next, run 'prk init' to set it up; update later with 'prk update'"
