@@ -29,6 +29,15 @@ const SCOPES: &[&str] = &[
 
 pub fn run(path: &Path) -> Result<(), String> {
     if !std::io::stdin().is_terminal() {
+        // Git Bash's own window (mintty) is not a console that Windows programs
+        // can read from; winpty, which ships with Git Bash, bridges it.
+        if std::env::var_os("MSYSTEM").is_some() {
+            return Err(
+                "prk init asks questions, which Git Bash's window cannot pass on. Run: winpty prk init\n\
+                 (or run prk init in PowerShell, cmd or Windows Terminal)"
+                    .to_string(),
+            );
+        }
         return Err("prk init asks questions; run it in a terminal".to_string());
     }
     let mut cfg = Draft::open(path)?;
@@ -39,9 +48,11 @@ pub fn run(path: &Path) -> Result<(), String> {
     } else {
         channel
     };
-    let claude_bin = Some(cfg.get("claude", "bin"))
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| "claude".to_string());
+    let claude_bin = config::program(
+        &Some(cfg.get("claude", "bin"))
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "claude".to_string()),
+    );
 
     println!("{}", dim(&format!("config {}", path.display())));
 
@@ -297,6 +308,7 @@ fn secret_until(
 /// `prk-<login name>`, used for the Slack app and the GitHub token.
 fn app_name() -> String {
     let user: String = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default()
         .to_lowercase()
         .chars()
@@ -611,8 +623,8 @@ fn ssh(key: &str, host: &str) -> Result<(), String> {
                 fail(&format!("git cannot reach GitHub over ssh: {e}"));
                 println!(
                     "  Add an ssh key to your GitHub account, for example:\n    \
-                     ssh-keygen -t ed25519            # skip if ~/.ssh/id_ed25519 exists\n    \
-                     gh ssh-key add ~/.ssh/id_ed25519.pub   # or paste it at https://github.com/settings/keys"
+                     ssh-keygen -t ed25519            # skip if .ssh/id_ed25519 exists in your home folder\n    \
+                     gh ssh-key add <home>/.ssh/id_ed25519.pub   # or paste it at https://github.com/settings/keys"
                 );
                 if !confirm("Check again?")? {
                     warn("skipped; reviews fail to clone until this works");
@@ -687,7 +699,6 @@ mod tests {
 
     #[test]
     fn draft_writes_a_private_minimal_config_that_loads() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("prk-init-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("prk/config.toml");
@@ -699,8 +710,12 @@ mod tests {
         d.set("github", "token", "").unwrap();
         d.set("claude", "oauth_token", "sk-ant-oat01-x").unwrap();
         d.set("slack", "app_token", "xapp-2").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let cfg = Config::load(&path).unwrap();
         cfg.check_private().unwrap();
         assert_eq!(cfg.slack.app_token, "xapp-2");

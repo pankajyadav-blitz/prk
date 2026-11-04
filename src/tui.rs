@@ -65,9 +65,14 @@ fn panel(title: &str) -> Block<'static> {
         ))
 }
 
-/// Open a URL in the browser; WSL first, then Linux, then macOS.
+/// Open a URL in the browser: Windows, or WSL first, then Linux, then macOS.
 fn open_url(url: &str) -> bool {
-    ["wslview", "xdg-open", "open"].iter().any(|opener| {
+    let openers: &[&str] = if cfg!(windows) {
+        &["explorer"]
+    } else {
+        &["wslview", "xdg-open", "open"]
+    };
+    openers.iter().any(|opener| {
         std::process::Command::new(opener)
             .arg(url)
             .stdin(std::process::Stdio::null())

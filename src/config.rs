@@ -192,10 +192,47 @@ pub fn default_path() -> PathBuf {
     home().join(".config/prk/config.toml")
 }
 
+/// $HOME, else %USERPROFILE% (PowerShell and cmd on Windows set no HOME).
 fn home() -> PathBuf {
-    std::env::var("HOME")
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The program to run for `name`. On Windows, a bare name is looked up on PATH
+/// with each PATHEXT extension, so an npm-installed `claude.cmd` is found
+/// (`Command` alone only tries `.exe`). Elsewhere, and when nothing matches,
+/// `name` is returned as it is.
+pub fn program(name: &str) -> String {
+    if !cfg!(windows) {
+        return name.to_string();
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    find_program(name, &path, &exts)
+}
+
+fn find_program(name: &str, path: &std::ffi::OsStr, pathext: &str) -> String {
+    if Path::new(name).extension().is_some() || name.contains(['/', '\\']) {
+        return name.to_string();
+    }
+    let pathext = if pathext.is_empty() {
+        ".COM;.EXE;.BAT;.CMD"
+    } else {
+        pathext
+    };
+    for dir in std::env::split_paths(path) {
+        for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+            let candidate = dir.join(format!("{name}{}", ext.to_lowercase()));
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// `~/x` -> `$HOME/x`; anything else unchanged.
@@ -218,6 +255,7 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         cfg.source = path.to_path_buf();
+        cfg.claude.bin = program(&cfg.claude.bin);
         if cfg.workdir.is_empty() {
             cfg.workdir = "~/.local/share/prk".to_string();
         }
@@ -275,6 +313,14 @@ impl Config {
     }
 
     /// The file holds tokens, so refuse to run while other users can read it.
+    /// On Windows the file sits in the user's own profile, private by default.
+    #[cfg(windows)]
+    pub fn check_private(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The file holds tokens, so refuse to run while other users can read it.
+    #[cfg(unix)]
     pub fn check_private(&self) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&self.source)
@@ -381,6 +427,79 @@ mod tests {
         assert!(!tools.iter().any(|t| t == "Bash(gh api:*)"));
         assert!(!tools.iter().any(|t| t.starts_with("Bash(gh pr review")));
         assert!(!tools.iter().any(|t| t == "Edit" || t == "Write"));
+    }
+
+    #[test]
+    fn find_program_prefers_exe_and_finds_cmd() {
+        let root = std::env::temp_dir().join(format!("prk-find-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("tool.cmd"), "").unwrap();
+        std::fs::write(b.join("tool.exe"), "").unwrap();
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        let exts = ".COM;.EXE;.BAT;.CMD";
+        // first directory wins, with the first extension found in it
+        assert_eq!(
+            find_program("tool", &path, exts),
+            a.join("tool.cmd").to_string_lossy()
+        );
+        let only_b = std::env::join_paths([&b]).unwrap();
+        assert_eq!(
+            find_program("tool", &only_b, exts),
+            b.join("tool.exe").to_string_lossy()
+        );
+        assert_eq!(find_program("missing", &path, exts), "missing");
+        assert_eq!(find_program("tool.exe", &path, exts), "tool.exe");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An npm-installed claude on Windows is claude.cmd. Run one the way a review
+    /// runs claude: the prompt on stdin, arguments with ( ) * , : and spaces.
+    #[cfg(windows)]
+    #[test]
+    fn a_cmd_shim_gets_the_prompt_on_stdin_and_the_arguments_intact() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("prk shim {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fakeclaude.cmd"),
+            "@echo off\r\nmore\r\necho ARGS %*\r\n",
+        )
+        .unwrap();
+        let path = std::env::join_paths([&dir]).unwrap();
+        let bin = find_program("fakeclaude", &path, ".COM;.EXE;.BAT;.CMD");
+        assert!(bin.ends_with("fakeclaude.cmd"), "{bin}");
+        let file = dir.join("system prompt.txt");
+        let mut child = Command::new(&bin)
+            .args([
+                "-p",
+                "--allowedTools",
+                "Read,Bash(gh pr view 823:*),Bash(git log:*)",
+                "--append-system-prompt-file",
+                &file.to_string_lossy(),
+                "--max-budget-usd",
+                "2",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"/code-review medium --comment 823\nsecond line\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("/code-review medium --comment 823"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        assert!(text.contains("Bash(gh pr view 823:*)"), "{text}");
+        assert!(text.contains("system prompt.txt"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

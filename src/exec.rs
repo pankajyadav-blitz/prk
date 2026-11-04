@@ -20,8 +20,11 @@ impl Exec {
         }
         let mut ssh = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new".to_string();
         if !gh.ssh_key.is_empty() {
-            let key = crate::config::expand(&gh.ssh_key);
-            ssh.push_str(&format!(" -o IdentitiesOnly=yes -i '{}'", key.display()));
+            // git runs this through sh, Git for Windows too, which wants / in paths.
+            let key = crate::config::expand(&gh.ssh_key)
+                .to_string_lossy()
+                .replace('\\', "/");
+            ssh.push_str(&format!(" -o IdentitiesOnly=yes -i '{key}'"));
         }
         cmd.env("GIT_SSH_COMMAND", ssh)
             .env("GIT_TERMINAL_PROMPT", "0")

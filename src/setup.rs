@@ -20,7 +20,7 @@ pub fn run(config: &Path, claude_bin: &str, token: Option<String>) -> Result<(),
     };
     write_private(config, &set_oauth_token(&text, &token))?;
     println!(
-        "Saved claude.oauth_token in {} (mode 600). Run `prk check` to confirm.",
+        "Saved claude.oauth_token in {}. Run `prk check` to confirm.",
         config.display()
     );
     Ok(())
@@ -57,18 +57,27 @@ fn check_token(token: &str) -> Result<String, String> {
 }
 
 /// Write the config readable by its owner only, creating its folder if needed.
+/// (On Windows the user's profile folder is already private to them.)
 pub fn write_private(config: &Path, text: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = config.parent()
         && !dir.as_os_str().is_empty()
         && !dir.exists()
     {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     std::fs::write(config, text).map_err(|e| format!("{}: {e}", config.display()))?;
-    std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("{}: {e}", config.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("{}: {e}", config.display()))?;
+    }
+    Ok(())
 }
 
 /// The config text with `oauth_token` set in `[claude]` and `api_key` emptied

@@ -86,7 +86,7 @@ impl Reviewer {
         }
         let repos = self.cfg().workdir().join("repos");
         if repos.exists() {
-            match std::fs::remove_dir_all(&repos) {
+            match remove_tree(&repos) {
                 Ok(()) => info!("removed leftover clones in {}", repos.display()),
                 Err(e) => crate::warn!("could not remove {}: {e}", repos.display()),
             }
@@ -371,7 +371,7 @@ impl Reviewer {
     fn checkout(&self, pr: &PrRef, info: &PrInfo, dir: &Path) -> Result<(), String> {
         if !dir.join(".git").is_dir() {
             if dir.exists() {
-                std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                remove_tree(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             }
             let parent = dir.parent().unwrap_or(dir);
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -502,9 +502,13 @@ impl Reviewer {
         stop: &Stop,
     ) -> Result<(), ClaudeError> {
         let review = &self.cfg().review;
+        // The prompt goes in on stdin and the system prompt in a file: on Windows,
+        // an npm-installed claude is a .cmd, which cannot take multi-line arguments.
+        let system_prompt = log.with_extension("system-prompt.txt");
+        std::fs::write(&system_prompt, self.system_prompt(pr, context))
+            .map_err(|e| format!("{}: {e}", system_prompt.display()))?;
         let mut args: Vec<String> = vec![
             "-p".into(),
-            prompt.to_string(),
             "--output-format".into(),
             "text".into(),
             "--allowedTools".into(),
@@ -513,8 +517,8 @@ impl Reviewer {
                 .join(","),
             "--disallowedTools".into(),
             "Edit,Write,NotebookEdit,WebFetch,WebSearch".into(),
-            "--append-system-prompt".into(),
-            self.system_prompt(pr, context),
+            "--append-system-prompt-file".into(),
+            system_prompt.to_string_lossy().into_owned(),
         ];
         if review.max_budget_usd > 0.0 {
             args.extend(["--max-budget-usd".into(), review.max_budget_usd.to_string()]);
@@ -547,16 +551,51 @@ impl Reviewer {
         let mut cmd = Command::new(&self.cfg().claude.bin);
         cmd.args(&args)
             .current_dir(dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(file)
             .stderr(stderr);
         self.exec.with_env(&mut cmd);
         // Its own process group, so stopping it also stops what it started
         // (shell commands, gh, git), and a ctrl-c in prk's terminal reaches prk only.
+        #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-        let mut child = cmd
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            std::os::windows::process::CommandExt::creation_flags(
+                &mut cmd,
+                CREATE_NEW_PROCESS_GROUP,
+            );
+        }
+        let spawned = cmd
             .spawn()
-            .map_err(|e| format!("{}: {e}", self.cfg().claude.bin))?;
+            .map_err(|e| format!("{}: {e}", self.cfg().claude.bin));
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = std::fs::remove_file(&system_prompt);
+                return Err(e.into());
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let prompt = prompt.to_string();
+            // A thread, so a prompt bigger than the pipe buffer cannot block the wait.
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(prompt.as_bytes());
+            });
+        }
+        let result = self.wait_claude(&mut child, log, stop);
+        let _ = std::fs::remove_file(&system_prompt);
+        result
+    }
+
+    fn wait_claude(
+        &self,
+        child: &mut std::process::Child,
+        log: &Path,
+        stop: &Stop,
+    ) -> Result<(), ClaudeError> {
+        let review = &self.cfg().review;
 
         let deadline = Instant::now() + Duration::from_secs(review.timeout_minutes * 60);
         let status = loop {
@@ -566,7 +605,7 @@ impl Reviewer {
                 Err(e) => return Err(ClaudeError::Failed(format!("waiting for claude: {e}"))),
             }
             if stop.is_set() || Instant::now() >= deadline {
-                kill_group(&mut child);
+                kill_group(child);
                 if stop.is_set() {
                     return Err(ClaudeError::Stopped);
                 }
@@ -601,8 +640,21 @@ impl Reviewer {
     }
 }
 
+/// Stop a child and everything it started: the whole process tree.
+#[cfg(windows)]
+fn kill_group(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Stop a child started in its own process group, and everything it started:
 /// SIGTERM to the group, then SIGKILL if it is still there after 5 seconds.
+#[cfg(unix)]
 fn kill_group(child: &mut std::process::Child) {
     let group = format!("-{}", child.id());
     let signal = |sig: &str| {
@@ -717,12 +769,44 @@ fn remove_clone(dir: &Path) {
     if !dir.exists() {
         return;
     }
-    match std::fs::remove_dir_all(dir) {
+    match remove_tree(dir) {
         Ok(()) => debug!("removed {}", dir.display()),
         Err(e) => crate::warn!("could not remove {}: {e}", dir.display()),
     }
     if let Some(org) = dir.parent() {
         let _ = std::fs::remove_dir(org);
+    }
+}
+
+/// `remove_dir_all`, which on Windows also clears the read-only flag git puts on
+/// its object files.
+pub fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(windows) && dir.exists() => {
+            clear_read_only(dir);
+            std::fs::remove_dir_all(dir).map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn clear_read_only(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    clear_read_only(&entry.path());
+                }
+            }
+        } else {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
     }
 }
 
@@ -738,6 +822,44 @@ fn log_tail(path: &Path, lines: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remove_tree_deletes_read_only_files() {
+        let dir = std::env::temp_dir().join(format!("prk-rm-{}", std::process::id()));
+        let pack = dir.join(".git/objects/pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        let file = pack.join("pack-1.idx");
+        std::fs::write(&file, "x").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms).unwrap();
+        remove_tree(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// Stopping a review must also stop what claude started.
+    #[cfg(windows)]
+    #[test]
+    fn kill_group_stops_the_whole_tree() {
+        use std::os::windows::process::CommandExt;
+        let started = Instant::now();
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping -n 60 127.0.0.1 > nul"])
+            .creation_flags(0x0000_0200)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        kill_group(&mut child);
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(1));
+        let tasks = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq PING.EXE", "/NH"])
+            .output()
+            .unwrap();
+        let tasks = String::from_utf8_lossy(&tasks.stdout).to_lowercase();
+        assert!(!tasks.contains("ping.exe"), "ping survived: {tasks}");
+    }
+
     use super::*;
 
     #[test]

@@ -47,7 +47,7 @@ machine or on a server.
 
 ## 1. Install
 
-You need these on the machine that runs `prk` (Linux, macOS, or Windows via WSL):
+You need these on the machine that runs `prk` (Linux, macOS, WSL, or Windows in PowerShell, cmd or Git Bash):
 
 | Tool | Check | Install |
 |---|---|---|
@@ -55,7 +55,13 @@ You need these on the machine that runs `prk` (Linux, macOS, or Windows via WSL)
 | GitHub CLI | `gh --version` | https://cli.github.com (`gh auth login` is optional: `prk init` can use it, or a token instead) |
 | Claude Code | `claude --version` | `npm install -g @anthropic-ai/claude-code` |
 
-Install the prebuilt `prk` binary (no Rust needed):
+On Windows, install Claude Code with its native installer, `irm https://claude.ai/install.ps1 | iex`
+in PowerShell. The npm version (`claude.cmd`) works too. Git for Windows (https://git-scm.com)
+gives you `git`, `ssh` and Git Bash.
+
+Install the prebuilt `prk` binary (no Rust needed).
+
+**Linux, macOS, WSL, Git Bash:**
 
 ```bash
 curl -fsSL https://github.com/pankajyadav-blitz/prk/releases/latest/download/install.sh | sh
@@ -72,6 +78,26 @@ prk init          # next step
 - **Update** later with `prk update` (downloads the latest release, checks its sha256, replaces the binary).
 - Other folder: `curl -fsSL .../install.sh | PRK_INSTALL_DIR=/usr/local/bin sh`. A fixed version: `PRK_VERSION=v0.1.1`.
 - Direct downloads (one archive per platform, with a `.sha256`): https://github.com/pankajyadav-blitz/prk/releases/latest
+
+**Windows PowerShell:**
+
+```powershell
+irm https://github.com/pankajyadav-blitz/prk/releases/latest/download/install.ps1 | iex
+```
+
+**Windows cmd:**
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/pankajyadav-blitz/prk/releases/latest/download/install.ps1 | iex"
+```
+
+On Windows, both installers put `prk.exe` in `%USERPROFILE%\.local\bin` and add that folder to your
+user `PATH`; open a new window afterwards. The config lives at
+`%USERPROFILE%\.config\prk\config.toml`, the same place for PowerShell, cmd and Git Bash.
+
+> **Git Bash:** its own window (mintty) cannot pass typed input to Windows programs, so run
+> `winpty prk init` there, or run `prk init` in PowerShell, cmd or Windows Terminal. Everything
+> else (`prk`, `prk -H`, `prk review`, ...) works as is.
 
 **From source instead** (needs Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`):
 
@@ -215,6 +241,17 @@ systemctl --user status prk        # is it running?
 journalctl --user -u prk -f        # live log
 systemctl --user restart prk       # after editing the config
 ```
+
+**Windows:** there is no systemd. Leave `prk` running in a Windows Terminal tab, or start it at
+login with Task Scheduler (it opens a console window you can minimize):
+
+```bat
+schtasks /Create /TN prk /SC ONLOGON /TR "\"%USERPROFILE%\.local\bin\prk.exe\""
+schtasks /Run /TN prk        &REM start it now
+schtasks /Delete /TN prk /F  &REM remove it
+```
+
+After `prk update`, close the running `prk` and start it again.
 
 While the service runs, `prk -H`, `prk -c` and `prk --stats` still work from any
 terminal: they read the same local database.

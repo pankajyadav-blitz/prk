@@ -21,6 +21,8 @@ jobs:
             runner: macos-latest
           - target: aarch64-apple-darwin
             runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -40,15 +42,22 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
 
       - name: Package
+        shell: bash
         run: |
-          archive_name="prk-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive_name" -C "target/${{ matrix.target }}/release" prk
-          shasum -a 256 "$archive_name" > "$archive_name.sha256"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            archive_name="prk-${{ matrix.target }}.zip"
+            (cd "target/${{ matrix.target }}/release" && 7z a -tzip "$GITHUB_WORKSPACE/$archive_name" prk.exe)
+            sha256sum "$archive_name" > "$archive_name.sha256"
+          else
+            archive_name="prk-${{ matrix.target }}.tar.gz"
+            tar -czf "$archive_name" -C "target/${{ matrix.target }}/release" prk
+            shasum -a 256 "$archive_name" > "$archive_name.sha256"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: prk-${{ matrix.target }}
-          path: prk-${{ matrix.target }}.tar.gz*
+          path: prk-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -63,7 +72,7 @@ jobs:
 
       - name: Add the installer, service file and VERSION
         run: |
-          cp install.sh prk.service config.example.toml dist/
+          cp install.sh install.ps1 prk.service config.example.toml dist/
           echo "$GITHUB_REF_NAME" > dist/VERSION
 
       - uses: softprops/action-gh-release@v2

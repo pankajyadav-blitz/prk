@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # Build the Windows release archive exactly as release.yml does, serve it
+  # locally, install it with install.ps1 (PowerShell 7, Windows PowerShell 5.1,
+  # cmd) and install.sh (Git Bash), and run the installed prk.exe in each shell.
+  windows-install:
+    runs-on: windows-latest
+    env:
+      PRK_BASE_URL: http://127.0.0.1:8765
+      PRK_CONFIG: ${{ github.workspace }}\ci-config.toml
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package like a release
+        shell: bash
+        run: |
+          mkdir dist
+          archive_name="prk-x86_64-pc-windows-msvc.zip"
+          (cd target/x86_64-pc-windows-msvc/release && 7z a -tzip "$GITHUB_WORKSPACE/dist/$archive_name" prk.exe)
+          (cd dist && sha256sum "$archive_name" > "$archive_name.sha256")
+          cp install.sh install.ps1 dist/
+          echo "v0.0.0-ci" > dist/VERSION
+          7z l dist/$archive_name
+
+      - name: Serve the release files
+        shell: pwsh
+        run: |
+          Start-Process python -ArgumentList '-m','http.server','8765','--bind','127.0.0.1','--directory','dist' -WindowStyle Hidden
+          Start-Sleep 3
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/VERSION).Content
+
+      - name: Install with install.ps1 (PowerShell 7)
+        shell: pwsh
+        run: |
+          $env:PRK_INSTALL_DIR = "$env:RUNNER_TEMP\pwsh-bin"
+          irm "$env:PRK_BASE_URL/install.ps1" | iex
+          & "$env:RUNNER_TEMP\pwsh-bin\prk.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Install with install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $env:PRK_INSTALL_DIR = "$env:RUNNER_TEMP\ps5-bin"
+          irm "$env:PRK_BASE_URL/install.ps1" | iex
+          & "$env:RUNNER_TEMP\ps5-bin\prk.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Install from cmd
+        shell: cmd
+        run: |
+          set PRK_INSTALL_DIR=%RUNNER_TEMP%\cmd-bin
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "irm %PRK_BASE_URL%/install.ps1 | iex" || exit /b 1
+          "%RUNNER_TEMP%\cmd-bin\prk.exe" --version || exit /b 1
+
+      - name: Install with install.sh (Git Bash)
+        shell: bash
+        run: |
+          curl -fsSL "$PRK_BASE_URL/install.sh" | PRK_INSTALL_DIR="$RUNNER_TEMP/gitbash-bin" sh
+          "$RUNNER_TEMP/gitbash-bin/prk.exe" --version
+
+      - name: Install Claude Code from npm (a claude.cmd, found through PATHEXT)
+        shell: pwsh
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          Get-Command claude | Format-List Source
+
+      - name: Write a test config
+        shell: pwsh
+        run: |
+          @"
+          [slack]
+          app_token = "xapp-not-a-real-token"
+          reviewer = "U0TEST"
+
+          [github]
+          orgs = ["cli"]
+          "@ | Set-Content -Encoding utf8NoBOM $env:PRK_CONFIG
+
+      - name: Run prk in PowerShell
+        shell: pwsh
+        run: |
+          $prk = "$env:RUNNER_TEMP\pwsh-bin\prk.exe"
+          & $prk --help | Select-String init
+          # check: the fake Slack token fails, github and claude-less lines still print
+          $out = & $prk check 2>&1 | Out-String; $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 1) { throw "check should fail on the fake Slack token (exit $code)" }
+          if ($out -notmatch 'slack .*invalid_auth') { throw "no slack line" }
+          if ($out -notmatch 'github .*posted as') { throw "github check did not run gh" }
+          if ($out -notmatch 'claude .*Claude Code') { throw "claude.cmd was not found or did not run" }
+          & $prk -H; if ($LASTEXITCODE -ne 0) { throw "history failed" }
+          & $prk --stats; if ($LASTEXITCODE -ne 0) { throw "stats failed" }
+          & $prk review https://github.com/cli/cli/pull/1 --dry-run; if ($LASTEXITCODE -ne 0) { throw "dry run failed" }
+          # init needs a terminal; without one it must say so, not hang
+          $out = '' | & $prk init 2>&1 | Out-String
+          if ($out -notmatch 'run it in a terminal') { throw "init: $out" }
+          Test-Path "$HOME\.local\share\prk\state.sqlite3"
+
+      - name: Run prk in cmd
+        shell: cmd
+        run: |
+          "%RUNNER_TEMP%\cmd-bin\prk.exe" --version || exit /b 1
+          "%RUNNER_TEMP%\cmd-bin\prk.exe" -H || exit /b 1
+          "%RUNNER_TEMP%\cmd-bin\prk.exe" review https://github.com/cli/cli/pull/1 --dry-run || exit /b 1
+
+      - name: Run prk in Git Bash
+        shell: bash
+        run: |
+          prk="$RUNNER_TEMP/gitbash-bin/prk.exe"
+          "$prk" -H
+          "$prk" review https://github.com/cli/cli/pull/1 --dry-run
+          out="$(echo | MSYSTEM=MINGW64 "$prk" init 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -q "winpty prk init"
+
+      - name: prk update downloads, verifies and swaps the running exe
+        shell: pwsh
+        run: |
+          # Pretend the served build is newer than the installed one.
+          "v9.9.9" | Set-Content -NoNewline dist\VERSION
+          $prk = "$env:RUNNER_TEMP\pwsh-bin\prk.exe"
+          & $prk update; if ($LASTEXITCODE -ne 0) { throw "update failed" }
+          if (-not (Test-Path "$env:RUNNER_TEMP\pwsh-bin\prk.old.exe")) { throw "old exe was not moved aside" }
+          & $prk --version; if ($LASTEXITCODE -ne 0) { throw "updated exe does not run" }
+          if (Test-Path "$env:RUNNER_TEMP\pwsh-bin\prk.old.exe") { throw "old exe not cleaned up on the next start" }

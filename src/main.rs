@@ -148,12 +148,14 @@ fn die(message: impl AsRef<str>) -> ! {
 }
 
 fn main() {
+    // Before parsing: --version and --help exit inside it.
+    update::remove_old_binary();
     let cli = Cli::parse();
     log::set_verbose(cli.verbose);
     let path = cli.config.clone().unwrap_or_else(config::default_path);
     // Before loading: the config may still have placeholders the loader refuses.
     if let Some(Cmd::SetupToken { token }) = &cli.command {
-        if let Err(e) = setup::run(&path, "claude", token.clone()) {
+        if let Err(e) = setup::run(&path, &config::program("claude"), token.clone()) {
             die(e);
         }
         return;
@@ -739,6 +741,15 @@ fn probe_ssh(mut cmd: Command, host: &str) -> Result<String, String> {
     }
 }
 
+/// Ctrl-C, Ctrl-Break and closing the console window all stop prk cleanly.
+#[cfg(windows)]
+fn install_signal_handlers(stop: Arc<Stop>) {
+    if let Err(e) = ctrlc::set_handler(move || stop.set()) {
+        warn!("could not install the ctrl-c handler ({e})");
+    }
+}
+
+#[cfg(unix)]
 fn install_signal_handlers(stop: Arc<Stop>) {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
