@@ -169,41 +169,71 @@ pub fn reply(token: &str, channel: &str, thread: &str, text: &str) -> Result<(),
 }
 
 /// A member's name (real name, else display name, else handle), looked up once
-/// with `users.info` and then remembered for the life of the process.
+/// with `users.info` and then remembered for the life of the process. A failed
+/// lookup is logged and gives None.
 pub fn user_name(token: &str, user: &str) -> Option<String> {
+    match lookup_name(token, user) {
+        Ok(name) => name,
+        Err(e) => {
+            crate::warn!("could not look up the Slack name of {user}: {e}");
+            None
+        }
+    }
+}
+
+fn lookup_name(token: &str, user: &str) -> Result<Option<String>, String> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let names = NAMES.get_or_init(Default::default);
-    if let Some(n) = names.lock().ok()?.get(user) {
-        return Some(n.clone());
+    if let Some(n) = names.lock().unwrap_or_else(|e| e.into_inner()).get(user) {
+        return Ok(Some(n.clone()));
     }
-    if token.is_empty() || user.is_empty() {
-        return None;
+    if user.is_empty() {
+        return Ok(None);
+    }
+    if token.is_empty() {
+        return Err("slack.bot_token is empty".to_string());
     }
     let data: Value = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .ok()?
+        .map_err(|e| e.to_string())?
         .post("https://slack.com/api/users.info")
         .bearer_auth(token)
         .form(&[("user", user)])
         .send()
-        .ok()?
-        .json()
-        .ok()?;
-    let u = data.get("user")?;
+        .and_then(|r| r.json())
+        .map_err(|e| format!("users.info: {e}"))?;
+    if data.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = data
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let hint = if err == "missing_scope" {
+            " -- add the users:read bot scope and reinstall the app"
+        } else {
+            ""
+        };
+        return Err(format!("users.info: {err}{hint}"));
+    }
+    let u = data.get("user").ok_or("users.info: no user")?;
     let field = |k: &str| u.pointer(k).and_then(Value::as_str).unwrap_or("");
-    let name = [
+    let Some(name) = [
         field("/profile/real_name"),
         field("/profile/display_name"),
         field("/name"),
     ]
     .into_iter()
-    .find(|n| !n.is_empty())?
-    .to_string();
-    names.lock().ok()?.insert(user.to_string(), name.clone());
-    Some(name)
+    .find(|n| !n.is_empty())
+    .map(str::to_string) else {
+        return Ok(None);
+    };
+    names
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(user.to_string(), name.clone());
+    Ok(Some(name))
 }
 
 #[cfg(test)]

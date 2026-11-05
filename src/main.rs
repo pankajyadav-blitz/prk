@@ -511,6 +511,20 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
     };
     let queue = Arc::new(queue);
 
+    // Jobs from before names were saved, or whose lookup failed, show only a
+    // Slack id: fill in their names in the background.
+    if !bot_token.is_empty() {
+        let db = db.clone();
+        let bot_token = bot_token.clone();
+        std::thread::spawn(move || {
+            for user in db.unnamed_requesters() {
+                if let Some(name) = slack::user_name(&bot_token, &user) {
+                    db.name_requester(&user, &name);
+                }
+            }
+        });
+    }
+
     let listener = {
         let stop = stop.clone();
         let queue = queue.clone();

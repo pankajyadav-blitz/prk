@@ -526,6 +526,27 @@ impl Db {
             .flatten()
     }
 
+    /// Slack members who asked for a review whose name is not saved yet.
+    pub fn unnamed_requesters(&self) -> Vec<String> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT requested_by FROM jobs WHERE requested_by != '' AND requested_name = ''",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], |r| r.get(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    }
+
+    /// Save a member's name on every job they asked for that has none yet.
+    pub fn name_requester(&self, user: &str, name: &str) {
+        self.exec(
+            "UPDATE jobs SET requested_name = ?2 WHERE requested_by = ?1 AND requested_name = ''",
+            params![user, name],
+        );
+    }
+
     pub fn waiting(&self) -> Vec<Job> {
         self.select(
             &format!(
