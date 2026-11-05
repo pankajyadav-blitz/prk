@@ -586,6 +586,7 @@ is about 16 MB and takes around 10 seconds.
 | `✗ slack ... invalid_auth` | `slack.app_token` must be the `xapp-` app-level token, not the `xoxb-` bot token |
 | `✗ catch-up ... not_in_channel` | Run `prk init` again (it joins the channel), or `/invite @<your app>` in the channel |
 | `✗ catch-up ... missing_scope` | Add the `channels:history` bot scope and reinstall the app |
+| `could not reply in Slack: ... missing_scope` | Add the `chat:write` bot scope and reinstall the app (prk replies in the request thread when a review leaves comments) |
 | Tagged, but nothing happens | Run `prk -d -v`. Check the app is invited to the channel, `message.channels` is subscribed, and `slack.reviewer` is your member id. Make sure no other process uses the same app token. |
 | `✗ github` | Token expired, or not approved by the org yet. `prk check` names the account. |
 | `✗ git ssh` | `ssh -T git@github.com` must greet you; set `github.ssh_key` |

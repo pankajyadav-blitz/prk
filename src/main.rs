@@ -315,7 +315,7 @@ fn review_now(cfg: Config, db: Arc<Db>, url: &str, force: bool, dry_run: bool) {
     let pr = parse_pr(url);
     require_tools(&cfg);
     let id = match db
-        .enqueue(&pr.owner, &pr.repo, pr.number, "", "", "manual", force)
+        .enqueue(&pr.owner, &pr.repo, pr.number, "", "", "", "manual", force)
         .unwrap_or_else(|e| die(e))
     {
         Enqueued::New(id) | Enqueued::Seen(id) => id,
@@ -468,6 +468,7 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
         let db = db.clone();
         let channel = channel.clone();
         let reviewer_id = reviewer_id.clone();
+        let bot_token = bot_token.clone();
         move |event: &serde_json::Value, source: &str| -> bool {
             let Some(request) = slack::request(event, &channel, &reviewer_id, &orgs) else {
                 return false;
@@ -480,11 +481,20 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
                     pr.number,
                     &request.user,
                     &request.ts,
+                    &request.thread,
                     source,
                     false,
                 ) {
-                    Ok(Enqueued::New(_)) => {
-                        info!("queued {} (asked by {}, {source})", pr.key(), request.user);
+                    Ok(Enqueued::New(id)) => {
+                        let who = slack::user_name(&bot_token, &request.user);
+                        if let Some(name) = &who {
+                            db.set_requested_name(id, name);
+                        }
+                        info!(
+                            "queued {} (asked by {}, {source})",
+                            pr.key(),
+                            who.as_deref().unwrap_or(&request.user)
+                        );
                         queued = true;
                     }
                     Ok(Enqueued::Pending(_, status)) => info!("{} is already {status}", pr.key()),

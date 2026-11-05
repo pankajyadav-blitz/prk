@@ -50,6 +50,10 @@ pub struct Job {
     pub started_at: i64,
     pub finished_at: i64,
     pub not_before: i64,
+    /// Slack thread to tell about the comments; empty = none.
+    pub slack_thread: String,
+    /// Slack name of `requested_by`; empty if unknown.
+    pub requested_name: String,
 }
 
 impl Job {
@@ -163,7 +167,7 @@ pub struct Db {
 
 const JOB_COLUMNS: &str = "id, owner, repo, number, status, kind, head, prev_head, title, author, \
      requested_by, slack_ts, source, force, attempts, reason, log, queued_at, started_at, \
-     finished_at, not_before";
+     finished_at, not_before, slack_thread, requested_name";
 
 fn job_from(row: &Row) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -188,6 +192,8 @@ fn job_from(row: &Row) -> rusqlite::Result<Job> {
         started_at: row.get(18)?,
         finished_at: row.get(19)?,
         not_before: row.get(20)?,
+        slack_thread: row.get(21)?,
+        requested_name: row.get(22)?,
     })
 }
 
@@ -278,6 +284,18 @@ impl Db {
                last_ts TEXT NOT NULL);",
         )
         .map_err(err)?;
+        // Added later: databases made before them get the columns now.
+        for column in ["slack_thread", "requested_name"] {
+            if conn
+                .prepare(&format!("SELECT {column} FROM jobs LIMIT 0"))
+                .is_err()
+            {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE jobs ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                ))
+                .map_err(err)?;
+            }
+        }
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -297,6 +315,7 @@ impl Db {
         number: u64,
         requested_by: &str,
         slack_ts: &str,
+        slack_thread: &str,
         source: &str,
         force: bool,
     ) -> Result<Enqueued, String> {
@@ -332,9 +351,9 @@ impl Db {
             return Ok(Enqueued::Pending(id, status));
         }
         conn.execute(
-            "INSERT INTO jobs (owner, repo, number, status, requested_by, slack_ts, source, force, queued_at) \
-             VALUES (?1, ?2, ?3, 'waiting', ?4, ?5, ?6, ?7, ?8)",
-            params![owner, repo, n, requested_by, slack_ts, source, force as i64, now()],
+            "INSERT INTO jobs (owner, repo, number, status, requested_by, slack_ts, slack_thread, source, force, queued_at) \
+             VALUES (?1, ?2, ?3, 'waiting', ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![owner, repo, n, requested_by, slack_ts, slack_thread, source, force as i64, now()],
         )
         .map_err(|e| e.to_string())?;
         Ok(Enqueued::New(conn.last_insert_rowid()))
@@ -386,6 +405,14 @@ impl Db {
     }
 
     /// Record what the PR lookup found.
+    /// Save the Slack name of who asked for the review.
+    pub fn set_requested_name(&self, id: i64, name: &str) {
+        self.exec(
+            "UPDATE jobs SET requested_name = ?2 WHERE id = ?1",
+            params![id, name],
+        );
+    }
+
     pub fn describe(
         &self,
         id: i64,
@@ -637,16 +664,16 @@ mod tests {
     fn a_pr_is_queued_once_while_pending_and_a_message_only_once() {
         let db = temp("enqueue");
         let first = db
-            .enqueue("o", "r", 1, "U1", "1.0", "slack", false)
+            .enqueue("o", "r", 1, "U1", "1.0", "", "slack", false)
             .unwrap();
         let Enqueued::New(id) = first else { panic!() };
         assert_eq!(
-            db.enqueue("o", "r", 1, "U2", "2.0", "slack", false)
+            db.enqueue("o", "r", 1, "U2", "2.0", "", "slack", false)
                 .unwrap(),
             Enqueued::Pending(id, WAITING.into())
         );
         assert_eq!(
-            db.enqueue("o", "r", 1, "U1", "1.0", "catch-up", false)
+            db.enqueue("o", "r", 1, "U1", "1.0", "", "catch-up", false)
                 .unwrap(),
             Enqueued::Seen(id)
         );
@@ -654,12 +681,12 @@ mod tests {
         db.finish(id, REVIEWED, "2 comments");
         // finished: a new message queues it again; the old message still does not
         assert!(matches!(
-            db.enqueue("o", "r", 1, "U2", "3.0", "slack", false)
+            db.enqueue("o", "r", 1, "U2", "3.0", "", "slack", false)
                 .unwrap(),
             Enqueued::New(_)
         ));
         assert_eq!(
-            db.enqueue("o", "r", 1, "U1", "1.0", "catch-up", false)
+            db.enqueue("o", "r", 1, "U1", "1.0", "", "catch-up", false)
                 .unwrap(),
             Enqueued::Seen(id)
         );
@@ -668,7 +695,10 @@ mod tests {
     #[test]
     fn a_job_is_claimed_by_one_taker_only() {
         let db = temp("claim");
-        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "manual", false).unwrap() else {
+        let Enqueued::New(id) = db
+            .enqueue("o", "r", 1, "", "", "", "manual", false)
+            .unwrap()
+        else {
             panic!()
         };
         assert!(db.claim(id).unwrap());
@@ -679,7 +709,7 @@ mod tests {
     #[test]
     fn failures_retry_with_a_delay_until_the_attempts_run_out() {
         let db = temp("fail");
-        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "slack", false).unwrap() else {
+        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "", "slack", false).unwrap() else {
             panic!()
         };
         for attempt in 1..=3 {
@@ -691,7 +721,7 @@ mod tests {
         assert_eq!(job.status, FAILED);
         assert_eq!(job.reason, "boom (attempt 3/3)");
 
-        let Enqueued::New(id) = db.enqueue("o", "r", 2, "", "", "slack", false).unwrap() else {
+        let Enqueued::New(id) = db.enqueue("o", "r", 2, "", "", "", "slack", false).unwrap() else {
             panic!()
         };
         assert!(db.claim(id).unwrap());
@@ -703,7 +733,7 @@ mod tests {
     #[test]
     fn a_usage_limit_requeue_does_not_spend_an_attempt() {
         let db = temp("requeue");
-        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "slack", false).unwrap() else {
+        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "", "slack", false).unwrap() else {
             panic!()
         };
         db.claim(id).unwrap();
@@ -715,7 +745,7 @@ mod tests {
     #[test]
     fn jobs_of_a_dead_process_are_recovered() {
         let db = temp("recover");
-        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "slack", false).unwrap() else {
+        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "", "slack", false).unwrap() else {
             panic!()
         };
         db.claim(id).unwrap();
@@ -731,7 +761,7 @@ mod tests {
         let db = temp("history");
         for (n, status) in [(1, REVIEWED), (2, SKIPPED), (1, REVIEWED)] {
             let Enqueued::New(id) = db
-                .enqueue("o", "suchna", n, "", "", "slack", false)
+                .enqueue("o", "suchna", n, "", "", "", "slack", false)
                 .unwrap()
             else {
                 panic!()
@@ -760,7 +790,7 @@ mod tests {
     #[test]
     fn verdicts_land_on_the_saved_comment() {
         let db = temp("verdict");
-        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "slack", false).unwrap() else {
+        let Enqueued::New(id) = db.enqueue("o", "r", 1, "", "", "", "slack", false).unwrap() else {
             panic!()
         };
         db.save_comments(&[Comment {

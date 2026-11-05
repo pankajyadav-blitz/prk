@@ -262,6 +262,7 @@ impl Reviewer {
                         ClaudeError::Stopped => "stopped".to_string(),
                     };
                     self.db.save_comments(&posted);
+                    self.tell_thread(job, &pr, &posted);
                     let summary = match &follow_up {
                         Some(_) => self.record_verdicts(&earlier, &posted, &info.head),
                         None => count(&posted),
@@ -271,6 +272,7 @@ impl Reviewer {
                 (Err(e), _) => return Err(e),
             };
             self.db.save_comments(&posted);
+            self.tell_thread(job, &pr, &posted);
             Ok(match &follow_up {
                 Some(_) => self.record_verdicts(&earlier, &posted, &info.head),
                 None => count(&posted),
@@ -289,6 +291,37 @@ impl Reviewer {
                 self.db.finish(job.id, db::FAILED, &why);
                 End::Failed(why)
             }
+        }
+    }
+
+    /// Tell the Slack thread that asked for the review to check the comments.
+    /// Nothing is sent when the review left none.
+    fn tell_thread(&self, job: &Job, pr: &PrRef, posted: &[Comment]) {
+        let token = &self.cfg().slack.bot_token;
+        if posted.is_empty() || job.slack_thread.is_empty() || token.is_empty() {
+            return;
+        }
+        let url = format!(
+            "https://github.com/{}/{}/pull/{}",
+            pr.owner, pr.repo, pr.number
+        );
+        let who = if job.requested_by.is_empty() {
+            String::new()
+        } else {
+            format!("<@{}> ", job.requested_by)
+        };
+        let text = format!(
+            "{who}Reviewed <{url}|{}>: left {} on the PR. Please check them.",
+            job.key(),
+            count(posted)
+        );
+        match crate::slack::reply(token, &self.cfg().slack.channel, &job.slack_thread, &text) {
+            Ok(()) => info!(
+                "{}: told the Slack thread about {}",
+                job.key(),
+                count(posted)
+            ),
+            Err(e) => crate::warn!("{}: could not reply in Slack: {e}", job.key()),
         }
     }
 

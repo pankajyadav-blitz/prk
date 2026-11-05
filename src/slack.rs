@@ -64,6 +64,8 @@ pub fn pr_links(text: &str, orgs: &[String]) -> Vec<PrRef> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub ts: String,
+    /// The thread to reply in: the message's parent, or the message itself.
+    pub thread: String,
     pub user: String,
     pub prs: Vec<PrRef>,
 }
@@ -115,15 +117,93 @@ pub fn request(event: &Value, channel: &str, reviewer: &str, orgs: &[String]) ->
     if prs.is_empty() {
         return None;
     }
+    let ts = message
+        .get("ts")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let thread = message
+        .get("thread_ts")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| ts.clone());
     Some(Request {
-        ts: message
-            .get("ts")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        ts,
+        thread,
         user: user.to_string(),
         prs,
     })
+}
+
+/// Reply in a Slack thread with `chat.postMessage`.
+pub fn reply(token: &str, channel: &str, thread: &str, text: &str) -> Result<(), String> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let data: Value = http
+        .post("https://slack.com/api/chat.postMessage")
+        .bearer_auth(token)
+        .form(&[
+            ("channel", channel),
+            ("thread_ts", thread),
+            ("text", text),
+            ("unfurl_links", "false"),
+        ])
+        .send()
+        .and_then(|r| r.json())
+        .map_err(|e| format!("chat.postMessage: {e}"))?;
+    if data.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let err = data
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let hint = match err {
+        "missing_scope" => " -- add the chat:write bot scope and reinstall the app",
+        "not_in_channel" => " -- invite the app to the channel",
+        _ => "",
+    };
+    Err(format!("chat.postMessage: {err}{hint}"))
+}
+
+/// A member's name (real name, else display name, else handle), looked up once
+/// with `users.info` and then remembered for the life of the process.
+pub fn user_name(token: &str, user: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let names = NAMES.get_or_init(Default::default);
+    if let Some(n) = names.lock().ok()?.get(user) {
+        return Some(n.clone());
+    }
+    if token.is_empty() || user.is_empty() {
+        return None;
+    }
+    let data: Value = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?
+        .post("https://slack.com/api/users.info")
+        .bearer_auth(token)
+        .form(&[("user", user)])
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    let u = data.get("user")?;
+    let field = |k: &str| u.pointer(k).and_then(Value::as_str).unwrap_or("");
+    let name = [
+        field("/profile/real_name"),
+        field("/profile/display_name"),
+        field("/name"),
+    ]
+    .into_iter()
+    .find(|n| !n.is_empty())?
+    .to_string();
+    names.lock().ok()?.insert(user.to_string(), name.clone());
+    Some(name)
 }
 
 #[cfg(test)]

@@ -400,6 +400,7 @@ impl App {
             action.number,
             "",
             "",
+            "",
             "manual",
             true,
         ) {
@@ -637,6 +638,10 @@ fn job_line(job: &Job, flash: bool, width: u16) -> ListItem<'static> {
         Span::styled(format!("{} ", glyph(&job.status)), Style::new().fg(color)),
         Span::raw(format!("{:<22} ", view::clip(&job.short_key(), 22))),
         Span::styled(
+            format!("{:<14} ", view::clip(&requester(job), 14)),
+            Style::new().fg(Color::Cyan),
+        ),
+        Span::styled(
             format!("{:<10}", view::status_word(job)),
             Style::new().fg(color),
         ),
@@ -648,7 +653,7 @@ fn job_line(job: &Job, flash: bool, width: u16) -> ListItem<'static> {
         Span::raw(view::clip(
             &note,
             (width as usize)
-                .saturating_sub(2 + 23 + 10 + 7 + 2 + 16 + 4)
+                .saturating_sub(2 + 23 + 15 + 10 + 7 + 2 + 16 + 4)
                 .max(10),
         )),
     ]);
@@ -661,6 +666,17 @@ fn job_line(job: &Job, flash: bool, width: u16) -> ListItem<'static> {
         }))
     } else {
         item
+    }
+}
+
+/// Who asked for the review: their Slack name, else their id, else "manual".
+fn requester(job: &Job) -> String {
+    if !job.requested_name.is_empty() {
+        job.requested_name.clone()
+    } else if !job.requested_by.is_empty() {
+        job.requested_by.clone()
+    } else {
+        "manual".to_string()
     }
 }
 
@@ -1083,6 +1099,7 @@ mod tests {
                 n,
                 who,
                 &format!("{n}.0"),
+                "",
                 "slack",
                 false,
             )

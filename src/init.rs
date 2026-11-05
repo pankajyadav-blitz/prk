@@ -23,6 +23,7 @@ use crate::view::{bold, dim, paint};
 const SCOPES: &[&str] = &[
     "channels:history",
     "channels:join",
+    "chat:write",
     "users:read",
     "users:read.email",
 ];
@@ -692,7 +693,7 @@ mod tests {
         );
         assert_eq!(
             m["oauth_config"]["scopes"]["bot"].as_array().unwrap().len(),
-            4
+            5
         );
         assert_eq!(m["display_information"]["name"], "prk-test");
     }
