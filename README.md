@@ -472,6 +472,7 @@ full review instead. Set `review.follow_up = false` to always do full reviews, o
 |---|---|
 | `prk` was off or started late | On start it reads **today's** messages (from 00:00, machine time) and queues every request that tags you (needs `slack.bot_token`) |
 | Requests from before today | Not picked up on start. Ask again, or run `prk review <url>`. |
+| Slack connection lost (laptop asleep, network drop) | After 90 s of silence `prk` reconnects by itself, then reads today's messages and thread replies again, like on start, so requests sent meanwhile are not lost. Slack's planned hourly reconnect does not trigger this. |
 | Restarted several times today | Each start rescans the whole day; a message already turned into a job is recognised and not queued again |
 | Same message seen live and by catch-up | Queued once (each Slack message becomes at most one job per PR) |
 | Same PR tagged in several messages | Queued once while it is waiting or running |

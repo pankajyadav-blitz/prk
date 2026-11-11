@@ -115,8 +115,14 @@ fn connect(url: &str) -> Result<Socket, String> {
 }
 
 /// Connect and pump events until `stop` is set, reconnecting with backoff.
-pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
+///
+/// `on_resync` runs after a reconnect that followed a real break (the link went
+/// silent, a read failed, or connecting failed), not after Slack's planned
+/// hourly reconnect. Events sent while the link was down may be lost, so the
+/// caller uses it to read the channel again.
+pub fn run(app_token: &str, on_event: &dyn Fn(&Value), on_resync: &dyn Fn(), stop: &Stop) {
     let mut attempt: u32 = 0;
+    let mut broken = false;
     while !stop.is_set() {
         let connected = open_connection(app_token)
             .and_then(|url| connect(&url).map_err(|e| format!("socket connect failed: {e}")));
@@ -124,6 +130,7 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
             Ok(socket) => socket,
             Err(why) => {
                 attempt += 1;
+                broken = true;
                 let wait = (1u64 << (attempt - 1).min(6)).min(60);
                 error!("{why} -- retrying in {wait}s");
                 stop.wait(wait as f64);
@@ -136,6 +143,10 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
         crate::activity::get().set_connected(true);
         attempt = 0;
         debug!("socket: connected");
+        if broken {
+            broken = false;
+            on_resync();
+        }
         // Slack pings every ~30s, so a quiet read only means a dead link if it lasts.
         set_read_timeout(&mut socket, Duration::from_secs(45));
         // Wall clock, not Instant: a sleeping laptop stops the monotonic clock,
@@ -170,6 +181,7 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
                             "socket: nothing from Slack for {}s (the computer was asleep, or the network dropped) -- reconnecting",
                             silent.as_secs()
                         );
+                        broken = true;
                         break;
                     }
                     let _ = socket.flush();
@@ -177,6 +189,7 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
                 Err(e) => {
                     if !stop.is_set() {
                         warn!("socket: read failed ({e}) -- reconnecting");
+                        broken = true;
                     }
                     break;
                 }

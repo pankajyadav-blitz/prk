@@ -1,6 +1,6 @@
 [package]
 name = "prk"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Review GitHub PRs with Claude Code when someone tags the reviewer in a Slack channel"
 

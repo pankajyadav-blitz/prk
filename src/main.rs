@@ -571,45 +571,65 @@ fn listen(cfg: Config, db: Arc<Db>, dry_run: bool) {
         });
     }
 
+    // Read today's channel messages (and thread replies) and queue the requests.
+    // Runs on start, and again after Slack's connection broke, since events sent
+    // meanwhile may be lost. One run at a time; later triggers are dropped.
+    let catch_up_enabled = !bot_token.is_empty() && catch_up;
+    if bot_token.is_empty() {
+        info!("no slack.bot_token, so no catch-up on requests posted while prk was off");
+    }
+    let catch_up_now: Arc<dyn Fn() + Send + Sync> = {
+        let queue = queue.clone();
+        let channel = channel.clone();
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Arc::new(move || {
+            if !catch_up_enabled || running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let queue = queue.clone();
+            let channel = channel.clone();
+            let bot_token = bot_token.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                match catchup::messages(&bot_token, &channel, catchup::today_start()) {
+                    Ok(messages) => {
+                        let n = messages.iter().filter(|m| queue(m, "catch-up")).count();
+                        info!(
+                            "caught up on today's {} message(s): {n} new request(s)",
+                            messages.len()
+                        );
+                        activity::get().set_caught_up(Ok(n));
+                    }
+                    Err(e) => {
+                        warn!("catch-up failed: {e}");
+                        activity::get().set_caught_up(Err(e));
+                    }
+                }
+                running.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        })
+    };
+
     let listener = {
         let stop = stop.clone();
         let queue = queue.clone();
+        let resync = catch_up_now.clone();
         std::thread::spawn(move || {
             socket::run(
                 &app_token,
                 &|event| {
                     queue(event, "slack");
                 },
+                &|| {
+                    info!("Slack connection was down; reading today's messages again");
+                    resync();
+                },
                 &stop,
             )
         })
     };
 
-    if bot_token.is_empty() || !catch_up {
-        if bot_token.is_empty() {
-            info!("no slack.bot_token, so no catch-up on requests posted while prk was off");
-        }
-    } else {
-        let queue = queue.clone();
-        let channel = channel.clone();
-        let oldest = catchup::today_start();
-        std::thread::spawn(
-            move || match catchup::messages(&bot_token, &channel, oldest) {
-                Ok(messages) => {
-                    let n = messages.iter().filter(|m| queue(m, "catch-up")).count();
-                    info!(
-                        "caught up on today's {} message(s): {n} new request(s)",
-                        messages.len()
-                    );
-                    activity::get().set_caught_up(Ok(n));
-                }
-                Err(e) => {
-                    warn!("catch-up failed: {e}");
-                    activity::get().set_caught_up(Err(e));
-                }
-            },
-        );
-    }
+    catch_up_now();
 
     let worker = {
         let stop = stop.clone();
