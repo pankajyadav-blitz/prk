@@ -86,15 +86,42 @@ fn set_read_timeout(socket: &mut Socket, timeout: Duration) {
     }
 }
 
+/// Slack pings about every 30s. Nothing at all for this long means the link is
+/// dead (typically after the laptop slept: the connection is gone, but the socket
+/// never reports it).
+const SILENCE_LIMIT: Duration = Duration::from_secs(90);
+/// Connecting and the websocket handshake must finish within this.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Open the websocket with timeouts on connect, handshake and writes, so a dead
+/// network after wake-up fails fast and is retried instead of hanging.
+fn connect(url: &str) -> Result<Socket, String> {
+    use std::net::ToSocketAddrs;
+    let uri: tungstenite::http::Uri = url.parse().map_err(|e| format!("bad url ({e})"))?;
+    let host = uri.host().ok_or("url has no host")?;
+    let port = uri.port_u16().unwrap_or(443);
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host} ({e})"))?
+        .next()
+        .ok_or_else(|| format!("cannot resolve {host}"))?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|e| format!("cannot connect to {host} ({e})"))?;
+    let _ = tcp.set_read_timeout(Some(CONNECT_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(CONNECT_TIMEOUT));
+    tungstenite::client_tls(url, tcp)
+        .map(|(socket, _)| socket)
+        .map_err(|e| format!("websocket handshake failed ({e})"))
+}
+
 /// Connect and pump events until `stop` is set, reconnecting with backoff.
 pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
     let mut attempt: u32 = 0;
     while !stop.is_set() {
-        let connected = open_connection(app_token).and_then(|url| {
-            tungstenite::connect(&url).map_err(|e| format!("socket connect failed ({e})"))
-        });
+        let connected = open_connection(app_token)
+            .and_then(|url| connect(&url).map_err(|e| format!("socket connect failed: {e}")));
         let mut socket = match connected {
-            Ok((socket, _)) => socket,
+            Ok(socket) => socket,
             Err(why) => {
                 attempt += 1;
                 let wait = (1u64 << (attempt - 1).min(6)).min(60);
@@ -109,11 +136,18 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
         crate::activity::get().set_connected(true);
         attempt = 0;
         debug!("socket: connected");
-        // Slack pings every ~30s, so this only fires on a dead link.
+        // Slack pings every ~30s, so a quiet read only means a dead link if it lasts.
         set_read_timeout(&mut socket, Duration::from_secs(45));
+        // Wall clock, not Instant: a sleeping laptop stops the monotonic clock,
+        // so only the wall clock shows how long the link was really silent.
+        let mut last_heard = std::time::SystemTime::now();
 
         while !stop.is_set() {
-            match socket.read() {
+            let read = socket.read();
+            if read.is_ok() {
+                last_heard = std::time::SystemTime::now();
+            }
+            match read {
                 Ok(Message::Text(text)) => {
                     if !handle(text.as_str(), &mut socket, on_event) {
                         break;
@@ -130,6 +164,14 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    let silent = last_heard.elapsed().unwrap_or_default();
+                    if silent > SILENCE_LIMIT {
+                        warn!(
+                            "socket: nothing from Slack for {}s (the computer was asleep, or the network dropped) -- reconnecting",
+                            silent.as_secs()
+                        );
+                        break;
+                    }
                     let _ = socket.flush();
                 }
                 Err(e) => {
@@ -145,5 +187,16 @@ pub fn run(app_token: &str, on_event: &dyn Fn(&Value), stop: &Stop) {
         if !stop.is_set() {
             stop.wait(1.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_url_fails_at_once() {
+        assert!(connect("not a url").is_err());
+        assert!(connect("wss:///no-host").is_err());
     }
 }
