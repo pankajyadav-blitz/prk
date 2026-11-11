@@ -282,6 +282,7 @@ add that folder to the `Environment=PATH=` line. After `prk update`, run
 | `prk check` | Check the config and that Slack, catch-up, GitHub, ssh and Claude work |
 | `prk setup-token` | Create a Claude subscription token and save it in the config |
 | `prk update` | Update `prk` to the latest release |
+| `prk clear` | Delete the local database (queue, history, saved comments), logs and leftover clones. Asks first; `--yes` skips the question. The config is kept. Stop a running `prk` first. |
 | `-d`, `--dry-run` | Look PRs up and say what would happen; review and post nothing |
 | `-v`, `--verbose` | Debug logging, including every git/gh command |
 | `--config <path>` | Use a different config file |
@@ -325,6 +326,7 @@ follow-up), `skipped` (with the reason), `failed` (after 3 attempts).
 | `tab` | Switch between Queue and Recent |
 | `enter` | Details of the selected review and the comments it posted |
 | `o` | Open the PR in the browser |
+| `a` | Add PR links: paste one or more, `enter` queues them (same as `prk review <url>`, without leaving the dashboard). Pasting onto the dashboard opens the input by itself. `esc` cancels. |
 | `R` | Review the selected PR again (a full review; asks first) |
 | `x` | Drop the selected PR from the queue |
 | `p` | Pause / resume the queue (the review in progress finishes) |
@@ -483,7 +485,9 @@ full review instead. Set `review.follow_up = false` to always do full reviews, o
 | Claude usage limit | The queue pauses for 30 minutes; the PR waits without losing an attempt |
 | `prk` stopped or crashed mid-review | Claude and everything it started are stopped; the job is queued again for the next start |
 | ctrl-c during `prk review <url>` | Cancelled: Claude is stopped and the job is marked `skipped: cancelled`, not queued again |
-| Request posted as a thread reply | Seen live; **not** seen by catch-up, which only reads main channel messages |
+| Request posted as a thread reply | Queued, live or by catch-up. Only a reply that tags you counts (a tagged parent does not cover untagged replies). The review note goes back into that thread. |
+| Thread started before today, reply today | Caught up too: threads of the last 7 days are checked for replies from today (one `conversations.replies` call per active thread) |
+| A PR link pasted in the dashboard | Queued like `prk review <url>`; see [the dashboard](#the-dashboard) |
 
 ---
 

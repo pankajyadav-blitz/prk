@@ -10,7 +10,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -18,7 +21,7 @@ use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Para
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::activity;
-use crate::db::{self, Db, HistoryFilter, Job};
+use crate::db::{self, Db, Enqueued, HistoryFilter, Job};
 use crate::stop::Stop;
 use crate::view;
 
@@ -126,6 +129,8 @@ struct App {
     history_filter: HistoryFilter,
     search: Option<String>,
     search_committed: String,
+    /// PR links being typed or pasted to queue (`a`, or paste anywhere).
+    adding: Option<String>,
     overlay: Overlay,
     note: Option<(String, Instant)>,
     tick: usize,
@@ -153,6 +158,7 @@ impl App {
             history_filter: filter,
             search: None,
             search_committed: String::new(),
+            adding: None,
             overlay: Overlay::None,
             note: None,
             tick: 0,
@@ -270,6 +276,23 @@ impl App {
             }
             return true;
         }
+        // typing or pasting PR links
+        if let Some(text) = &mut self.adding {
+            match k.code {
+                KeyCode::Enter => {
+                    let text = std::mem::take(text);
+                    self.adding = None;
+                    self.add_prs(&text);
+                }
+                KeyCode::Esc => self.adding = None,
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char(c) => text.push(c),
+                _ => {}
+            }
+            return true;
+        }
         match &mut self.overlay {
             Overlay::Confirm(action) => {
                 if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -329,6 +352,7 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.open_selected(),
+            KeyCode::Char('a') => self.adding = Some(String::new()),
             KeyCode::Char('R') => {
                 if let Some(job) = self.selected() {
                     if job.status == db::WAITING || job.status == db::RUNNING {
@@ -393,17 +417,94 @@ impl App {
         }
     }
 
+    /// Text pasted into the terminal: PR links to queue. With no input open it
+    /// opens one, so a link can be pasted straight onto the dashboard.
+    fn paste(&mut self, text: &str) {
+        if self.search.is_some() {
+            return;
+        }
+        if matches!(self.overlay, Overlay::Confirm(_)) {
+            return;
+        }
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match &mut self.adding {
+            Some(typed) => {
+                if !typed.is_empty() && !typed.ends_with(' ') {
+                    typed.push(' ');
+                }
+                typed.push_str(&flat);
+            }
+            None if matches!(self.overlay, Overlay::None) => self.adding = Some(flat),
+            None => {}
+        }
+    }
+
+    /// Queue every PR link in `text`, as `prk review <url>` would (no forced
+    /// full review: a PR already reviewed at this commit is skipped by the worker).
+    fn add_prs(&mut self, text: &str) {
+        let prs = crate::slack::PrRef::find_all(text);
+        if prs.is_empty() {
+            self.say("no GitHub PR link found; paste one like https://github.com/org/repo/pull/12");
+            return;
+        }
+        let mut queued = Vec::new();
+        let mut notes = Vec::new();
+        for pr in &prs {
+            match self
+                .db
+                .enqueue(&pr.owner, &pr.repo, pr.number, "", "", "", "manual", false)
+            {
+                Ok(Enqueued::New(_)) => queued.push(pr.key()),
+                Ok(Enqueued::Pending(_, status)) => {
+                    notes.push(format!("{} is already {status}", pr.key()))
+                }
+                Ok(Enqueued::Seen(_)) => notes.push(format!("{} is already queued", pr.key())),
+                Err(e) => notes.push(format!("{}: {e}", pr.key())),
+            }
+        }
+        let mut parts = Vec::new();
+        if !queued.is_empty() {
+            let tail = if self.live {
+                ""
+            } else {
+                " (the running `prk` picks it up)"
+            };
+            parts.push(format!("queued {}{tail}", queued.join(", ")));
+        }
+        parts.extend(notes);
+        self.say(parts.join("; "));
+        self.reload();
+    }
+
     fn rereview(&mut self, action: &Rereview) {
-        match self.db.enqueue(
+        // Reply in the PR's latest Slack thread, to whoever asked there.
+        let asked = self
+            .db
+            .history(&HistoryFilter {
+                pr: Some((action.owner.clone(), action.repo.clone(), action.number)),
+                ..Default::default()
+            })
+            .into_iter()
+            .find(|j| !j.slack_thread.is_empty());
+        let (who, name, thread) = asked
+            .map(|j| (j.requested_by, j.requested_name, j.slack_thread))
+            .unwrap_or_default();
+        let queued = self.db.enqueue(
             &action.owner,
             &action.repo,
             action.number,
+            &who,
             "",
-            "",
-            "",
+            &thread,
             "manual",
             true,
-        ) {
+        );
+        if let Ok(Enqueued::New(id)) = queued
+            && !name.is_empty()
+        {
+            self.db.set_requested_name(id, &name);
+        }
+        match queued {
             Ok(_) if self.live => self.say(format!("{} queued for a full review", action.label)),
             Ok(_) => self.say(format!(
                 "{} queued for a full review; the running `prk` picks it up",
@@ -448,7 +549,11 @@ pub fn history(db: Arc<Db>, filter: HistoryFilter) -> std::io::Result<()> {
 
 fn run(mut app: App, stop: &Stop) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    // So a pasted link arrives as one event, not as keystrokes (an Enter in it
+    // would otherwise submit early).
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app, stop);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -462,12 +567,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, stop: &Stop) -> std
             app.reload();
         }
         terminal.draw(|f| draw(f, app))?;
-        if event::poll(TICK)?
-            && let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-            && !app.key(k, stop)
-        {
-            return Ok(());
+        if event::poll(TICK)? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    if !app.key(k, stop) {
+                        return Ok(());
+                    }
+                }
+                Event::Paste(text) => app.paste(&text),
+                _ => {}
+            }
         }
         app.tick += 1;
     }
@@ -839,6 +948,28 @@ fn draw_history(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(text) = &app.adding {
+        // keep the hint visible: show only the end of a long paste
+        let room = (area.width as usize).saturating_sub(48).max(10);
+        let chars: Vec<char> = text.chars().collect();
+        let shown: String = if chars.len() > room {
+            format!(
+                "…{}",
+                chars[chars.len() - room..].iter().collect::<String>()
+            )
+        } else {
+            text.clone()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" PR ", Style::new().fg(Color::Black).bg(Color::Green)),
+                Span::raw(format!(" {shown}▏")),
+                muted("  paste PR link(s) · enter queue · esc cancel"),
+            ])),
+            area,
+        );
+        return;
+    }
     if let Some(query) = &app.search {
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -870,6 +1001,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("tab", "queue/recent"),
             ("enter", "details"),
             ("o", "open PR"),
+            ("a", "add PR"),
             ("R", "re-review"),
             ("x", "drop"),
             ("p", "pause"),
@@ -1089,7 +1221,10 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn sample_db() -> Arc<Db> {
-        let dir = std::env::temp_dir().join(format!("prk-tui-{}", std::process::id()));
+        // one folder per call: tests run in parallel
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("prk-tui-{}-{n}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let db = Arc::new(Db::open(&dir.join("state.sqlite3")).unwrap());
         let add = |repo: &str, n: u64, who: &str| match db
@@ -1182,6 +1317,63 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        let k = KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(app.key(k, &Stop::default()));
+    }
+
+    #[test]
+    fn pasting_pr_links_queues_them() {
+        let db = sample_db();
+        let mut app = App::new(
+            db.clone(),
+            Screen::Dashboard,
+            true,
+            HistoryFilter::default(),
+        );
+        let before = db.waiting().len();
+
+        // `a` opens the input, a paste fills it (newlines flattened), enter queues
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.adding.is_some());
+        app.paste("https://github.com/Blitzscale-19/new_repo/pull/5\nhttps://github.com/Blitzscale-19/other/pull/9\n");
+        let shown = render(&mut app, 130, 30);
+        assert!(
+            shown.contains("pull/5") && shown.contains("enter queue"),
+            "{shown}"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.adding.is_none());
+        assert_eq!(db.waiting().len(), before + 2);
+        let keys: Vec<String> = db.waiting().iter().map(|j| j.key()).collect();
+        assert!(keys.iter().any(|k| k.contains("new_repo#5")), "{keys:?}");
+        assert!(db.waiting().iter().any(|j| j.source == "manual"));
+
+        // pasting the same link again is not queued twice
+        app.paste("https://github.com/Blitzscale-19/new_repo/pull/5");
+        assert!(
+            app.adding.is_some(),
+            "a paste on the dashboard opens the input"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(db.waiting().len(), before + 2);
+        assert!(app.note.as_ref().unwrap().0.contains("already"));
+
+        // text without a link queues nothing and says so
+        press(&mut app, KeyCode::Char('a'));
+        for c in "hello".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(db.waiting().len(), before + 2);
+        assert!(app.note.as_ref().unwrap().0.contains("no GitHub PR link"));
+
+        // esc cancels
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.adding.is_none());
     }
 
     #[test]

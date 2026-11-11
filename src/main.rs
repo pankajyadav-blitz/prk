@@ -17,6 +17,7 @@
 
 mod activity;
 mod catchup;
+mod clear;
 mod config;
 mod db;
 mod exec;
@@ -63,7 +64,8 @@ use crate::view::{bold, dim, paint};
         prk init             set prk up on this machine (asks a few questions)\n  \
         prk check            check Slack, GitHub, ssh and Claude\n  \
         prk setup-token      create a Claude subscription token and save it in the config\n  \
-        prk update           update prk to the latest release"
+        prk update           update prk to the latest release\n  \
+        prk clear            delete local history, queue, comments, logs (keeps the config)"
 )]
 struct Cli {
     /// config.toml to read (default: $PRK_CONFIG, then ~/.config/prk/config.toml)
@@ -140,6 +142,12 @@ enum Cmd {
     },
     /// Update prk to the latest GitHub release
     Update,
+    /// Delete the local history, queue, saved comments, logs and clones (not the config)
+    Clear {
+        /// do not ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 fn die(message: impl AsRef<str>) -> ! {
@@ -176,6 +184,9 @@ fn main() {
     if let Err(e) = cfg.check_private() {
         die(e);
     }
+    if let Some(Cmd::Clear { yes }) = &cli.command {
+        return clear_local(&cfg.workdir(), *yes);
+    }
     debug!("config: {}", path.display());
     let db = Arc::new(Db::open(&cfg.workdir().join("state.sqlite3")).unwrap_or_else(|e| die(e)));
 
@@ -191,7 +202,10 @@ fn main() {
     match cli.command {
         Some(Cmd::Check) => std::process::exit(check(&cfg)),
         Some(Cmd::Review { url, force }) => review_now(cfg, db, &url, force, cli.dry_run),
-        Some(Cmd::SetupToken { .. }) | Some(Cmd::Update) | Some(Cmd::Init) => {
+        Some(Cmd::SetupToken { .. })
+        | Some(Cmd::Update)
+        | Some(Cmd::Init)
+        | Some(Cmd::Clear { .. }) => {
             unreachable!("handled before the config is loaded")
         }
         None => listen(cfg, db, cli.dry_run),
@@ -229,6 +243,38 @@ fn require_tools(cfg: &Config) {
         .collect();
     if !missing.is_empty() {
         die(format!("prk needs these on PATH:\n{}", missing.join("\n")));
+    }
+}
+
+/// `prk clear`: delete prk's local traces after a confirmation.
+fn clear_local(workdir: &std::path::Path, yes: bool) {
+    let entries = clear::found(workdir);
+    if entries.is_empty() {
+        println!("Nothing to clear in {}.", workdir.display());
+        return;
+    }
+    println!("This deletes prk's local data (the config is kept):");
+    for (path, size) in &entries {
+        println!("  {}  ({})", path.display(), clear::human(*size));
+    }
+    println!("The queue, history and saved comments are lost. Stop a running `prk` first.");
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            die("not a terminal: run `prk clear --yes` to skip the question");
+        }
+        eprint!("Delete all of it? [y/N] ");
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Cancelled; nothing deleted.");
+            return;
+        }
+    }
+    let failed = clear::remove(&entries);
+    if failed.is_empty() {
+        println!("Cleared.");
+    } else {
+        die(format!("could not remove:\n  {}", failed.join("\n  ")));
     }
 }
 

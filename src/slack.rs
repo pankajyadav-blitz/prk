@@ -34,6 +34,23 @@ impl PrRef {
             number: c[3].parse().ok()?,
         })
     }
+
+    /// Every PR link in `text` (pasted by the user), each once, in order.
+    pub fn find_all(text: &str) -> Vec<PrRef> {
+        let mut found: Vec<PrRef> = Vec::new();
+        for c in pr_regex().captures_iter(text) {
+            let Ok(number) = c[3].parse() else { continue };
+            let pr = PrRef {
+                owner: c[1].to_string(),
+                repo: c[2].to_string(),
+                number,
+            };
+            if !found.contains(&pr) {
+                found.push(pr);
+            }
+        }
+        found
+    }
 }
 
 fn pr_regex() -> &'static Regex {
@@ -305,6 +322,44 @@ mod tests {
             &format!("<@U1> review {link}"),
         );
         assert!(request(&retyped, "C1", "U1", &orgs()).is_none());
+    }
+
+    #[test]
+    fn a_tagged_thread_reply_with_a_pr_is_a_request_in_that_thread() {
+        let link = "<https://github.com/Blitzscale-19/alfred/pull/7|x>";
+        let mut reply = msg(&format!("<@U1> one more: {link}"));
+        reply["ts"] = json!("20.0");
+        reply["thread_ts"] = json!("10.0");
+        let req = request(&reply, "C1", "U1", &orgs()).unwrap();
+        assert_eq!(req.ts, "20.0");
+        assert_eq!(req.thread, "10.0");
+        assert_eq!(req.prs[0].key(), "Blitzscale-19/alfred#7");
+        // a broadcast reply is read the same way
+        reply["subtype"] = json!("thread_broadcast");
+        assert!(request(&reply, "C1", "U1", &orgs()).is_some());
+    }
+
+    #[test]
+    fn an_untagged_thread_reply_is_ignored_even_if_the_parent_tagged() {
+        let link = "<https://github.com/Blitzscale-19/alfred/pull/7|x>";
+        let mut reply = msg(&format!("and this one {link}"));
+        reply["ts"] = json!("20.0");
+        reply["thread_ts"] = json!("10.0");
+        assert!(request(&reply, "C1", "U1", &orgs()).is_none());
+        // a reply from the reviewer in the thread is never a request
+        let mut own = msg(&format!("<@U1> {link}"));
+        own["user"] = json!("U1");
+        own["thread_ts"] = json!("10.0");
+        assert!(request(&own, "C1", "U1", &orgs()).is_none());
+    }
+
+    #[test]
+    fn finds_every_pasted_link_once() {
+        let text = "https://github.com/a/b/pull/1 and https://github.com/a/b/pull/1/files\n\
+                    https://github.com/c/d/pull/22 junk https://github.com/c/d";
+        let keys: Vec<String> = PrRef::find_all(text).iter().map(PrRef::key).collect();
+        assert_eq!(keys, vec!["a/b#1", "c/d#22"]);
+        assert!(PrRef::find_all("no link here").is_empty());
     }
 
     #[test]
